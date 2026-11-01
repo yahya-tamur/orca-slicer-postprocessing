@@ -86,18 +86,213 @@ def drive_ready(letter):
     return bool(kernel32.GetVolumeInformationW(f"{letter}:\\", None, 0, None, None, None, None, 0))
 
 
-def eject(letter, timeout=25):
-    """Explorer's 'Eject' (safe removal) and wait until the volume is gone."""
+def request_eject(letter):
+    """Explorer's 'Eject' (safe removal). Returns at once without saying whether it worked, and a
+    refused one can pop up Windows' "Problem ejecting" message. Only a fallback for silent_eject."""
     cmd = ("$d=(New-Object -ComObject Shell.Application).Namespace(17).ParseName('%s:'); "
            "if ($d) { $d.InvokeVerb('Eject') }" % letter)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
                    creationflags=CREATE_NO_WINDOW, timeout=60, capture_output=True)
-    end = time.time() + timeout
-    while time.time() < end:
+
+
+# Silent eject through the Plug and Play configuration manager, the call "Safely Remove Hardware"
+# makes: drive letter -> disk number -> disk device -> its parent (the USB device) -> eject.
+setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+cfgmgr32 = ctypes.WinDLL("cfgmgr32")
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+
+class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("InterfaceClassGuid", GUID), ("Flags", wintypes.DWORD),
+                ("Reserved", ctypes.c_size_t)]
+
+
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", GUID), ("DevInst", wintypes.DWORD),
+                ("Reserved", ctypes.c_size_t)]
+
+
+class STORAGE_DEVICE_NUMBER(ctypes.Structure):
+    _fields_ = [("DeviceType", wintypes.DWORD), ("DeviceNumber", wintypes.DWORD),
+                ("PartitionNumber", wintypes.DWORD)]
+
+
+GUID_DEVINTERFACE_DISK = GUID(0x53F56307, 0xB6BF, 0x11D0, (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B))
+DIGCF_PRESENT, DIGCF_DEVICEINTERFACE = 0x02, 0x10
+IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x2D1080
+INVALID_HANDLE = wintypes.HANDLE(-1).value
+PNP_VETO = {0: "unknown", 1: "legacy device", 2: "pending close", 3: "an application", 4: "a service",
+            5: "an open file or window", 6: "another device", 7: "a driver", 8: "illegal request",
+            9: "insufficient power", 10: "not disableable", 11: "legacy driver", 12: "insufficient rights",
+            13: "already removed"}
+
+kernel32.CreateFileW.restype = wintypes.HANDLE
+kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+kernel32.DeviceIoControl.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p)
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+setupapi.SetupDiGetClassDevsW.argtypes = (ctypes.POINTER(GUID), wintypes.LPCWSTR, wintypes.HWND, wintypes.DWORD)
+setupapi.SetupDiEnumDeviceInterfaces.argtypes = (wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID),
+                                                 wintypes.DWORD, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA))
+setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = (wintypes.HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+                                                      ctypes.c_void_p, wintypes.DWORD,
+                                                      ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(SP_DEVINFO_DATA))
+setupapi.SetupDiDestroyDeviceInfoList.argtypes = (wintypes.HANDLE,)
+cfgmgr32.CM_Get_Parent.argtypes = (ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.ULONG)
+cfgmgr32.CM_Request_Device_EjectW.argtypes = (wintypes.DWORD, ctypes.POINTER(ctypes.c_int), wintypes.LPWSTR,
+                                              wintypes.ULONG, wintypes.ULONG)
+
+
+def _device_number(path):
+    """(DeviceType, DeviceNumber) of a volume or disk path, or None."""
+    h = kernel32.CreateFileW(path, 0, 3, None, 3, 0, None)  # no access needed; share read/write; OPEN_EXISTING
+    if h == INVALID_HANDLE:
+        return None
+    try:
+        sdn, got = STORAGE_DEVICE_NUMBER(), wintypes.DWORD()
+        if not kernel32.DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, None, 0, ctypes.byref(sdn),
+                                        ctypes.sizeof(sdn), ctypes.byref(got), None):
+            return None
+        return sdn.DeviceType, sdn.DeviceNumber
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def usb_device_of(letter):
+    """Device instance of the USB device holding the drive letter (the parent of its disk), or None.
+    Removable drives only, so a fixed disk is never ejected."""
+    if kernel32.GetDriveTypeW(f"{letter}:\\") != DRIVE_REMOVABLE:
+        return None
+    want = _device_number(f"\\\\.\\{letter}:")
+    if want is None:
+        return None
+    devs = setupapi.SetupDiGetClassDevsW(ctypes.byref(GUID_DEVINTERFACE_DISK), None, None,
+                                         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+    if devs == INVALID_HANDLE:
+        return None
+    try:
+        i = 0
+        while True:
+            iface = SP_DEVICE_INTERFACE_DATA(cbSize=ctypes.sizeof(SP_DEVICE_INTERFACE_DATA))
+            if not setupapi.SetupDiEnumDeviceInterfaces(devs, None, ctypes.byref(GUID_DEVINTERFACE_DISK), i,
+                                                        ctypes.byref(iface)):
+                return None
+            i += 1
+            need = wintypes.DWORD()
+            setupapi.SetupDiGetDeviceInterfaceDetailW(devs, ctypes.byref(iface), None, 0, ctypes.byref(need), None)
+            buf = ctypes.create_string_buffer(need.value)
+            # SP_DEVICE_INTERFACE_DETAIL_DATA_W: DWORD cbSize, then the path; cbSize is 8 on 64-bit.
+            ctypes.c_uint32.from_buffer(buf).value = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+            info = SP_DEVINFO_DATA(cbSize=ctypes.sizeof(SP_DEVINFO_DATA))
+            if not setupapi.SetupDiGetDeviceInterfaceDetailW(devs, ctypes.byref(iface), buf, need,
+                                                             None, ctypes.byref(info)):
+                continue
+            path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            if _device_number(path) == want:
+                parent = wintypes.DWORD()
+                if cfgmgr32.CM_Get_Parent(ctypes.byref(parent), info.DevInst, 0) != 0:
+                    return None
+                return parent.value
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(devs)
+
+
+def silent_eject(devinst):
+    """Ask Windows to eject the device, without any Windows message. Returns None when accepted,
+    else why it was refused (e.g. "an open file or window")."""
+    veto, name = ctypes.c_int(), ctypes.create_unicode_buffer(260)
+    result = cfgmgr32.CM_Request_Device_EjectW(devinst, ctypes.byref(veto), name, 260, 0)
+    if result == 0:
+        return None
+    return PNP_VETO.get(veto.value, f"veto {veto.value}") + (f" ({name.value})" if name.value else "")
+
+
+FSCTL_LOCK_VOLUME, FSCTL_DISMOUNT_VOLUME = 0x90018, 0x90020
+IOCTL_STORAGE_MEDIA_REMOVAL, IOCTL_STORAGE_EJECT_MEDIA = 0x2D4804, 0x2D4808
+PNP_VETO_ILLEGAL_REQUEST = "illegal request"
+
+
+def media_eject(letter):
+    """Eject the way Explorer does for sticks Windows doesn't treat as ejectable devices (no
+    'Removable' capability, so the device-level eject is an 'illegal request'): lock the volume,
+    dismount it and eject the media. Silent. Returns None when done, else why not; the lock fails
+    while anything still has a file or folder on the drive open."""
+    h = kernel32.CreateFileW(f"\\\\.\\{letter}:", 0x80000000 | 0x40000000, 3, None, 3, 0, None)  # read/write, share r/w
+    if h == INVALID_HANDLE:
+        return f"can't open the drive (error {ctypes.get_last_error()})"
+    try:
+        got = wintypes.DWORD()
+
+        def ioctl(code, inbuf=None, size=0):
+            return kernel32.DeviceIoControl(h, code, inbuf, size, None, 0, ctypes.byref(got), None)
+
+        if not ioctl(FSCTL_LOCK_VOLUME):
+            err = ctypes.get_last_error()
+            return PNP_VETO[5] if err in (5, 32) else f"lock failed (error {err})"  # access denied / sharing violation
+        if not ioctl(FSCTL_DISMOUNT_VOLUME):
+            return f"dismount failed (error {ctypes.get_last_error()})"
+        allow = ctypes.c_ubyte(0)  # PREVENT_MEDIA_REMOVAL { FALSE }
+        ioctl(IOCTL_STORAGE_MEDIA_REMOVAL, ctypes.byref(allow), 1)
+        if not ioctl(IOCTL_STORAGE_EJECT_MEDIA):
+            return f"eject failed (error {ctypes.get_last_error()})"
+        return None
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def eject_delay(seconds):
+    """Wait before the next eject attempt: quick at first (closing the window that holds the drive
+    should eject within moments), slower after 2 minutes, when something is holding it on purpose.
+    Each refusal adds an entry to Windows' System event log, so this caps it at ~110 per eject."""
+    return 2 if seconds < 120 else 10
+
+
+def eject(letter, timeout=600, waiting=None):
+    """Eject and wait until the volume is gone. Windows refuses an eject while something still has
+    the drive open (an Explorer window, a file opened from it, a virus scan of the new file) and
+    doesn't retry by itself, so the eject is retried (see eject_delay). waiting(seconds, reason) is
+    called about once a second meanwhile; reason is why the last attempt was refused, or None while
+    that isn't known. False if the volume is still there after timeout."""
+    start = time.time()
+    devinst = usb_device_of(letter)
+    method = "device" if devinst is not None else "media"
+    reason, last_reason, next_try = None, None, start
+    while time.time() - start < timeout:
         if not drive_ready(letter):
             return True
-        time.sleep(0.5)
-    return False
+        now = time.time()
+        if now >= next_try:
+            if method == "device":
+                reason = silent_eject(devinst)
+                if reason and reason.startswith(PNP_VETO_ILLEGAL_REQUEST):
+                    # Windows doesn't count this stick as an ejectable device: eject its media instead.
+                    log.info("%s: device can't be ejected (%s), ejecting the media instead", letter, reason)
+                    method = "media"
+            if method == "media":
+                reason = media_eject(letter)
+            if method == "explorer":  # can't report refusals and may show a message each time: rarely
+                request_eject(letter)
+                next_try = now + 30
+            else:
+                if reason and reason != last_reason:
+                    log.info("%s: eject refused after %.0f s: %s", letter, now - start, reason)
+                if reason and reason != PNP_VETO[5] and method == "media":
+                    # Not "in use" but a real failure (e.g. no access to the drive): let Explorer try.
+                    log.warning("%s: media eject failed (%s), falling back to Explorer's eject", letter, reason)
+                    method, reason = "explorer", None
+                    continue
+                last_reason = reason
+                next_try = now + eject_delay(now - start)
+        if waiting:
+            waiting(time.time() - start, reason)
+        time.sleep(0.25)
+    return not drive_ready(letter)
 
 
 _EXTENSION = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")  # ".gcode", ".txt" - not the ".2mm" in "part_0.2mm"
@@ -510,19 +705,41 @@ class Worker(threading.Thread):
         if not self.write_all(f"{letter}:\\", name):
             return
 
-        # Eject once, then wait for the stick to be pulled out.
-        self.call(win.update, f"Ejecting {name}...", busy=True)
-        if eject(letter):
-            # "Upload" and "Upload and Print" behave the same: prints are started on the printer.
-            what = "is" if len(self.batch) == 1 else "are"
-            self.finish(f"Done. {self.files_text()} {what} on the drive and it was ejected.\n"
-                        "You can unplug it now.")
-            log.info("ejected %s", letter)
-            self.close_when_unplugged(letter)
-        else:
-            self.finish(f"{self.files_text()} written, but {name} could not be ejected "
-                        "(something may still be using it). Eject it from the taskbar before unplugging.")
-            log.warning("eject failed for %s", letter)
+        # Eject (retrying while the drive is in use), then wait for the stick to be pulled out.
+        while True:
+            self.call(win.update, f"Ejecting {name}...\nDon't unplug it yet.", busy=True)
+            shown = [0]
+
+            def waiting(seconds, reason):
+                # Once Windows has refused (or, with the Explorer fallback, after 10 s), say the drive
+                # is in use, with a counter that ticks every second between the attempts.
+                if (reason or seconds >= 10) and int(seconds) != shown[0]:
+                    shown[0] = int(seconds)
+                    m, s = divmod(int(seconds), 60)
+                    elapsed = f"{s}s" if not m else f"{m}m" + (f" {s}s" if s else "")  # 45s, 1m, 1m 34s
+                    self.call(win.update, f"Trying to eject {name}: the drive is still in use ({elapsed}).\n"
+                                          "Close any Explorer window or file open from it. "
+                                          "Don't unplug it yet.", busy=True)
+
+            if eject(letter, waiting=waiting):
+                # "Upload" and "Upload and Print" behave the same: prints are started on the printer.
+                what = "is" if len(self.batch) == 1 else "are"
+                self.finish(f"Done. {self.files_text()} {what} on the drive and it was ejected.\n"
+                            "You can unplug it now.")
+                log.info("ejected %s", letter)
+                self.close_when_unplugged(letter)
+                return
+            log.warning("eject of %s still not done after the timeout", letter)
+            self.call(win.update, f"{name} still can't be ejected; something may be using it "
+                                  "(an open Explorer window or another program).\n"
+                                  "Close it and try again. Don't unplug the drive yet.", 0.0)
+            self.call(win.set_buttons, [("Close", lambda: self.picked.put(False)),
+                                        ("Try again", lambda: self.picked.put(True))])
+            again = self.picked.get()
+            self.call(win.set_buttons, [])
+            if not again:
+                self.call(win.close)
+                return
 
     def write_all(self, root, name):
         """Write every file of the batch into root, including uploads that arrive while copying.
@@ -553,13 +770,15 @@ class Worker(threading.Thread):
         self.call(win.show, self.title())
         data, tmp = job.data, target + ".part"
         with open(tmp, "wb") as f:
+            # Each chunk is flushed to the drive before the next, so the progress is the real
+            # transfer and not Windows' write cache filling up.
             step = 1 << 20
             for off in range(0, len(data), step):
                 f.write(data[off:off + step])
+                f.flush()
+                os.fsync(f.fileno())
                 frac = min(1.0, (off + step) / len(data))
                 self.call(win.update, f"Copying {job.target} to {name}{count}... {frac:.0%}", frac)
-            f.flush()
-            os.fsync(f.fileno())
         os.replace(tmp, target)
         job.data = None
         log.info("wrote %s", target)

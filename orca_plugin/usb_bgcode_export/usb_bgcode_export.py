@@ -38,7 +38,8 @@ import orca
 
 # Built from the environment, so the same file works for any Windows user. The expanded strings must
 # stay identical between runs: Orca's process permission is saved per exact command line.
-PROJECT = os.path.join(os.environ["USERPROFILE"], "Desktop", "claude environemnt", "orca slicer postprocessing")
+PROJECT = os.path.join(os.environ["USERPROFILE"], "Desktop", "claude environment", "3d printing",
+                       "orca-slicer-postprocessing")
 PYTHONW = os.path.join(os.environ["LOCALAPPDATA"], "Python", "pythoncore-3.14-64", "pythonw.exe")
 HELPER_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "usb_print_host.py")]
 CONVERT_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "convert_in_place.py")]
