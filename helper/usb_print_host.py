@@ -51,6 +51,8 @@ DRIVE_REMOVABLE = 2
 SYNCHRONIZE = 0x00100000
 WAIT_TIMEOUT = 0x102
 CREATE_NO_WINDOW = 0x08000000
+# Querying a drive whose media was just ejected must fail quietly, not pop up "insert a disk".
+kernel32.SetErrorMode(0x0001 | 0x8000)  # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
 
 
 # ------------------------------------------------------------------ drives
@@ -71,19 +73,24 @@ def removable_drives():
     return drives
 
 
-def drive_present(letter):
-    return bool(kernel32.GetLogicalDrives() & (1 << (ord(letter) - ord("A"))))
+def drive_ready(letter):
+    """True while the drive's volume is mounted and readable. After Windows' "safe to remove" some
+    USB sticks keep their drive letter (with no volume behind it) until unplugged, so the letter
+    alone can't tell that the eject finished."""
+    if not kernel32.GetLogicalDrives() & (1 << (ord(letter) - ord("A"))):
+        return False
+    return bool(kernel32.GetVolumeInformationW(f"{letter}:\\", None, 0, None, None, None, None, 0))
 
 
 def eject(letter, timeout=25):
-    """Explorer's 'Eject' (safe removal) and wait for the drive letter to disappear."""
+    """Explorer's 'Eject' (safe removal) and wait until the volume is gone."""
     cmd = ("$d=(New-Object -ComObject Shell.Application).Namespace(17).ParseName('%s:'); "
            "if ($d) { $d.InvokeVerb('Eject') }" % letter)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
                    creationflags=CREATE_NO_WINDOW, timeout=60, capture_output=True)
     end = time.time() + timeout
     while time.time() < end:
-        if not drive_present(letter):
+        if not drive_ready(letter):
             return True
         time.sleep(0.5)
     return False
