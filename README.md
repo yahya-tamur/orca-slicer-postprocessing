@@ -46,3 +46,7 @@ python converter/bgcode.py print.gcode [print.bgcode]
 - **Ejecting:** the stick is ejected silently through the same Windows call as "Safely Remove Hardware". On USB ports that Windows doesn't treat as removable, the drive is locked, dismounted and its media ejected instead, as Explorer does. If something still has the stick open, the window says it's in use and keeps retrying until it's free.
 - **Plugin API:** learned from the examples in [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) `v2.5.0-beta` (`sandboxes/`).
 - **Not in the repository:** the libbgcode reference sources and the G-code test files are kept locally only (see `.gitignore`).
+
+## License
+
+AGPL-3.0 (see `LICENSE`), the same license as libbgcode, which the converter's MeatPack code follows.
