@@ -7,6 +7,9 @@ libbgcode_reference/
 testdata/*.gcode
 testdata/*.bgcode
 
+# The plugin's local paths (copy orca_plugin/usb_bgcode_export/local_config.example.json)
+orca_plugin/usb_bgcode_export/local_config.json
+
 # Python and editor clutter
 __pycache__/
 *.pyc

@@ -27,8 +27,8 @@ The helper's window also handles:
 Needs Windows, Orca Slicer 2.5 or newer (for its Python plugins) and Python 3. Only the Python standard library is used.
 
 1. **Get the code.** Clone this repository somewhere permanent.
-2. **Point the plugin at it.** Near the top of `orca_plugin/usb_bgcode_export/usb_bgcode_export.py`, set `PROJECT` to the folder you cloned into and `PYTHONW` to your `pythonw.exe`.
-3. **Install the plugin.** With Orca closed, copy the `orca_plugin/usb_bgcode_export` folder into `%APPDATA%\OrcaSlicer\orca_plugins\`.
+2. **Point the plugin at it.** In `orca_plugin/usb_bgcode_export/`, copy `local_config.example.json` to `local_config.json` and set `project` to the folder you cloned into and `pythonw` to your `pythonw.exe`. Variables like `%USERPROFILE%` work. This file is git-ignored.
+3. **Install the plugin.** With Orca closed, copy `usb_bgcode_export.py` and `local_config.json` into `%APPDATA%\OrcaSlicer\orca_plugins\usb_bgcode_export\`. Copy them again after changing either one.
 4. **Enable it.** Start Orca, enable **USB bgcode export** in the Plugins dialog, and click **Allow** when Orca asks whether the plugin may run the helper and the converter.
 5. **Set up the printer.** In the printer's connection settings, set host type **OctoPrint**, address `127.0.0.1:51200`, and any API key. To get `.bgcode` names by default, end the process preset's file name format in `.bgcode`.
 

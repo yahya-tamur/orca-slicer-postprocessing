@@ -29,6 +29,7 @@ Orca audits subprocess.Popen against the exact command line, so both command lin
 and file path go in the environment). They and thread creation (preset edits must come from a
 background thread) are requested once via orca.request_permissions().
 """
+import json
 import os
 import subprocess
 import threading
@@ -36,13 +37,33 @@ import time
 
 import orca
 
-# Built from the environment, so the same file works for any Windows user. The expanded strings must
+# Where this repository and pythonw.exe are come from local_config.json next to this file (copy
+# local_config.example.json); %USERPROFILE%-style variables are expanded. The expanded strings must
 # stay identical between runs: Orca's process permission is saved per exact command line.
-PROJECT = os.path.join(os.environ["USERPROFILE"], "Desktop", "claude environment", "3d printing",
-                       "orca-slicer-postprocessing")
-PYTHONW = os.path.join(os.environ["LOCALAPPDATA"], "Python", "pythoncore-3.14-64", "pythonw.exe")
-HELPER_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "usb_print_host.py")]
-CONVERT_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "convert_in_place.py")]
+CONFIG_NAME = "local_config.json"
+
+
+def _plugin_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.join(os.environ["APPDATA"], "OrcaSlicer", "orca_plugins", "usb_bgcode_export")
+
+
+def _load_paths():
+    with open(os.path.join(_plugin_dir(), CONFIG_NAME), encoding="utf-8") as f:
+        cfg = json.load(f)
+    return os.path.expandvars(cfg["project"]), os.path.expandvars(cfg["pythonw"])
+
+
+try:
+    PROJECT, PYTHONW = _load_paths()
+    HELPER_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "usb_print_host.py")]
+    CONVERT_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "convert_in_place.py")]
+    CONFIG_ERROR = ""
+except Exception as e:  # missing or broken config: load anyway and say so instead of crashing Orca's loader
+    HELPER_COMMAND = CONVERT_COMMAND = None
+    CONFIG_ERROR = f"{CONFIG_NAME} in the plugin folder is missing or invalid ({type(e).__name__}: {e})"
 CREATE_NO_WINDOW = 0x08000000
 
 PIPELINE_CAPABILITY = "Export as bgcode"
@@ -74,6 +95,8 @@ class UsbBgcodeHelper(orca.script.ScriptPluginCapabilityBase):
     def _start(self):
         if self.proc is not None and self.proc.poll() is None:
             return "already running"
+        if CONFIG_ERROR:
+            raise RuntimeError(CONFIG_ERROR)
         env = dict(os.environ, ORCA_USB_HELPER_PID=str(os.getpid()))
         self.proc = subprocess.Popen(HELPER_COMMAND, env=env, creationflags=CREATE_NO_WINDOW, close_fds=True)
         return "started"
@@ -155,6 +178,9 @@ class ExportAsBgcode(orca.slicing.SlicingPipelineCapabilityBase):
             return orca.ExecutionResult.success()
         if ctx.host == "File" and not (ctx.output_name or "").lower().endswith(".bgcode"):
             return orca.ExecutionResult.success()  # Export G-code to a .gcode (or other) name: keep text
+        if CONFIG_ERROR:
+            return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError,
+                                                "Can't convert to .bgcode: " + CONFIG_ERROR)
         env = dict(os.environ, BGCODE_IN_PLACE=ctx.gcode_path)
         result = subprocess.run(CONVERT_COMMAND, env=env, creationflags=CREATE_NO_WINDOW, timeout=600)
         if result.returncode != 0:
@@ -168,8 +194,7 @@ class ExportAsBgcode(orca.slicing.SlicingPipelineCapabilityBase):
 class UsbBgcodeExport(orca.base):
     def register_capabilities(self):
         # Asked once by Orca after registration; grants are saved for these exact command lines.
-        orca.request_permissions(process=[subprocess.list2cmdline(HELPER_COMMAND),
-                                          subprocess.list2cmdline(CONVERT_COMMAND)],
-                                 threading=True)
+        commands = [subprocess.list2cmdline(c) for c in (HELPER_COMMAND, CONVERT_COMMAND) if c]
+        orca.request_permissions(process=commands, threading=True)
         orca.register_capability(UsbBgcodeHelper)
         orca.register_capability(ExportAsBgcode)
