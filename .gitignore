@@ -7,6 +7,9 @@ libbgcode_reference/
 testdata/*.gcode
 testdata/*.bgcode
 
+# Preset port: the user's own PrusaSlicer settings and the generator, local only. See README.md.
+preset_port/
+
 # Python and editor clutter
 __pycache__/
 *.pyc
