@@ -1,0 +1,14 @@
+# Third-party source kept locally for reference only (Prusa Research's libbgcode, AGPL-3.0).
+# See README.md, "Third-party material", for where to get it.
+libbgcode_reference/
+
+# G-code test files, local only: copies of PrusaSlicer's resources/test_data (AGPL-3.0) and the
+# user's own prints. See README.md, "Third-party material".
+testdata/*.gcode
+testdata/*.bgcode
+
+# Python and editor clutter
+__pycache__/
+*.pyc
+*.bgtmp
+*.part
