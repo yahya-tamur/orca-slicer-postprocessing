@@ -125,6 +125,17 @@ def with_extension(name, extension):
     return (name[:m.start()] if m else name) + extension
 
 
+def numbered_name(name, taken):
+    """name with " (k)" added before its extension, k the lowest number whose result isn't in taken
+    (lower-case names): "file.bgcode" -> "file (1).bgcode", "file (1).bgcode" -> "file (1) (1).bgcode"."""
+    m = _EXTENSION.search(name)
+    stem, ext = (name[:m.start()], m.group(0)) if m else (name, "")
+    k = 1
+    while f"{stem} ({k}){ext}".lower() in taken:
+        k += 1
+    return f"{stem} ({k}){ext}"
+
+
 # ------------------------------------------------------------------ PrusaLink (network alternative)
 # Address and login come from the Orca printer preset, as entered there by the user: print_host_webui
 # (the printer's own address; print_host points at this helper), printhost_user, printhost_password.
@@ -220,12 +231,24 @@ class PrusaLink:
                 return s["path"]
         raise RuntimeError("The printer has no writable storage. Is a USB stick plugged into the printer?")
 
-    def upload(self, name, data, progress=None, cancel=None):
-        """PUT the file into the printer's storage (not started)."""
+    def upload(self, name, data, progress=None, cancel=None, overwrite=False):
+        """PUT the file into the printer's storage (not started). Raises FileExistsError when the
+        name is taken there and overwrite is False. The Buddy firmware (lib/WUI/nhttp/gcode_upload.cpp)
+        answers 409 "File already exists" for that, but only after receiving the whole file; it also
+        uses 409 for "Another transfer in progress" and "File is busy" (overwriting the file being
+        printed), which are reported as errors instead."""
         storage = self.usb_storage().strip("/")
         uri = f"/api/v1/files/{urllib.parse.quote(storage)}/{urllib.parse.quote(name)}"
-        status, body = self._request("PUT", uri, data, {"Content-Type": "text/x.gcode", "Overwrite": "?1",
+        status, body = self._request("PUT", uri, data, {"Content-Type": "text/x.gcode",
+                                                        "Overwrite": "?1" if overwrite else "?0",
                                                         "Print-After-Upload": "?0"}, progress, cancel)
+        if status == 409:
+            text = body.decode("latin-1", "replace")
+            if "already exists" in text.lower():
+                raise FileExistsError(name)
+            detail = next((m for m in ("Another transfer in progress", "File is busy") if m.lower() in text.lower()),
+                          text.strip()[:200] or "conflict (HTTP 409)")
+            raise RuntimeError(f"The printer refused {name}: {detail}")
         if status == 401:
             raise RuntimeError("PrusaLink rejected the login. Check the password in Orca's printer connection settings.")
         if status not in (200, 201, 204):
@@ -240,6 +263,9 @@ class Job:
         self.filename, self.name_ok = safe_name(filename, self.binary)
         self.data = data
         self.start_print = start_print
+        self.target = None       # name at the destination, decided when it is written
+        self.overwrite = False   # the user chose Overwrite for a name taken there
+        self.written = False
 
 
 class Window:
@@ -360,19 +386,61 @@ class Worker(threading.Thread):
             self.call(win.show, job.filename)
             self.call(win.update, f'"{job.filename}" doesn\'t end in {expected}, but the file is {kind.split(" (")[0]}, '
                                   "so the printer may not read it under that name.")
-            self.call(win.set_buttons, [("Skip file", lambda: self.picked.put(None)),
+            self.call(win.set_buttons, [("Cancel", lambda: self.picked.put(None)),
                                         (f"Keep {os.path.splitext(job.filename)[1]}", lambda: self.picked.put(job.filename)),
                                         (f"Save as {expected}", lambda: self.picked.put(fixed))])
             choice = self.picked.get()
             if choice is None:
-                log.info("skipped %s (user choice)", job.filename)
+                log.info("cancelled %s (user choice)", job.filename)
                 self.call(win.show, self.title())
                 return
             log.info("name %s -> %s (user choice)", job.filename, choice)
             job.filename = choice
         job.data = data
-        self.batch.append(job)
+        # The same name uploaded again in this batch overwrites the earlier upload, which keeps the
+        # name it was given (or will be given) on the drive.
+        earlier = next((j for j in self.batch if j.filename.lower() == job.filename.lower()), None)
+        if earlier is not None:
+            if earlier.written:
+                earlier.overwrite = True  # its file is ours now; rewrite it without asking
+            earlier.data, earlier.binary, earlier.written = job.data, job.binary, False
+            log.info("%s overwrites the earlier upload of the same name in this batch", job.filename)
+        else:
+            self.batch.append(job)
         self.call(win.show, self.title())
+
+    def resolve_target(self, job, existing, place="the drive"):
+        """Pick the name job gets at its destination. existing: lower-case names already there.
+        A name taken there or by another file of this batch asks: Overwrite / Save as "name (k)" /
+        Cancel (drops just this file). Returns False when cancelled."""
+        others = {j.target.lower(): j for j in self.batch if j is not job and j.target}
+        key = job.filename.lower()
+        if key not in existing and key not in others:
+            job.target = job.filename
+            return True
+        new = numbered_name(job.filename, existing | set(others))
+        where = f"is already on {place}" if key in existing else "is already used by another file in this batch"
+        self.call(win.show, job.filename)
+        self.call(win.update, f'"{job.filename}" {where}.\nOverwrite it, or save the new file as "{new}"?')
+        self.call(win.set_buttons, [("Cancel", lambda: self.picked.put("cancel")),
+                                    ("Overwrite", lambda: self.picked.put("overwrite")),
+                                    ("New file", lambda: self.picked.put("new"))])
+        choice = self.picked.get()
+        self.call(win.set_buttons, [])
+        log.info("name conflict for %s: %s", job.filename, choice)
+        if choice == "cancel":
+            self.batch.remove(job)
+            self.call(win.show, self.title())
+            return False
+        if choice == "overwrite":
+            job.target, job.overwrite = job.filename, True
+            replaced = others.get(key)
+            if replaced is not None and not replaced.written:
+                self.batch.remove(replaced)  # never written: the new upload simply takes its place
+        else:
+            job.target = new
+        self.call(win.show, self.title())
+        return True
 
     def collect(self):
         """Add uploads that arrived meanwhile; True if any did."""
@@ -396,17 +464,9 @@ class Worker(threading.Thread):
             self.finish("Nothing to write.", 0.0)
             return
 
-        if self.test_dir:
-            done = []
-            while len(done) < len(self.batch):
-                for job in [j for j in self.batch if j not in done]:
-                    target = os.path.join(self.test_dir, job.filename)
-                    with open(target, "wb") as f:
-                        f.write(job.data)
-                    log.info("test mode: wrote %s", target)
-                    done.append(job)
-                self.collect()
-            self.finish(f"Test mode: wrote {self.files_text()} to {self.test_dir}")
+        if self.test_dir:  # same naming and writing, into a folder; no drive wait or eject
+            if self.write_all(self.test_dir, self.test_dir):
+                self.finish(f"Test mode: wrote {self.files_text()} to {self.test_dir}")
             return
 
         # Wait for a removable drive, collecting further uploads into the batch meanwhile.
@@ -447,13 +507,8 @@ class Worker(threading.Thread):
         name = f"{letter}: ({label})" if label else f"{letter}:"
         self.call(win.set_buttons, [])
 
-        # Write every file of the batch, including uploads that arrive while copying.
-        written = []
-        while len(written) < len(self.batch):
-            for job in [j for j in self.batch if j not in written]:
-                self.write_file(job, letter, name, len(written) + 1)
-                written.append(job)
-            self.collect()
+        if not self.write_all(f"{letter}:\\", name):
+            return
 
         # Eject once, then wait for the stick to be pulled out.
         self.call(win.update, f"Ejecting {name}...", busy=True)
@@ -469,8 +524,31 @@ class Worker(threading.Thread):
                         "(something may still be using it). Eject it from the taskbar before unplugging.")
             log.warning("eject failed for %s", letter)
 
-    def write_file(self, job, letter, name, index):
-        target = os.path.join(f"{letter}:\\", job.filename)
+    def write_all(self, root, name):
+        """Write every file of the batch into root, including uploads that arrive while copying.
+        Each name is checked against root as it is when that file's turn comes. False if nothing
+        was left to write (every file cancelled); the window then says so."""
+        while True:
+            pending = [j for j in self.batch if not j.written]
+            if not pending:
+                if not self.collect():
+                    break
+                continue
+            for job in pending:
+                if job not in self.batch:
+                    continue  # dropped by an earlier conflict prompt in this round
+                if job.target is None and not self.resolve_target(job, {n.lower() for n in os.listdir(root)}):
+                    continue
+                self.write_file(job, root, name, sum(j.written for j in self.batch) + 1)
+                job.written = True
+            self.collect()
+        if not self.batch:
+            self.finish("Nothing was written (every file was cancelled).", 0.0)
+            return False
+        return True
+
+    def write_file(self, job, root, name, index):
+        target = os.path.join(root, job.target)
         count = f" ({index} of {len(self.batch)})" if len(self.batch) > 1 else ""
         self.call(win.show, self.title())
         data, tmp = job.data, target + ".part"
@@ -479,7 +557,7 @@ class Worker(threading.Thread):
             for off in range(0, len(data), step):
                 f.write(data[off:off + step])
                 frac = min(1.0, (off + step) / len(data))
-                self.call(win.update, f"Copying {job.filename} to {name}{count}... {frac:.0%}", frac)
+                self.call(win.update, f"Copying {job.target} to {name}{count}... {frac:.0%}", frac)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, target)
@@ -496,18 +574,45 @@ class Worker(threading.Thread):
             self.call(win.update, f"Connecting to the printer at {base}...", busy=True)
             link = PrusaLink(base, user, password)
             storage = ""
-            while len(sent) < len(self.batch):
-                for job in [j for j in self.batch if j not in sent]:
+            on_printer = set()  # lower-case names the printer reported as taken (409)
+            while True:
+                pending = [j for j in self.batch if not j.written]
+                if not pending:
+                    if not self.collect():
+                        break
+                    continue
+                for job in pending:
+                    if job not in self.batch:
+                        continue  # dropped by an earlier conflict prompt in this round
+                    if job.target is None and not self.resolve_target(job, on_printer, "the printer"):
+                        continue
                     count = f" ({len(sent) + 1} of {len(self.batch)})" if len(self.batch) > 1 else ""
-
-                    def progress(f, job=job, count=count):
-                        self.call(win.update, f"Sending {job.filename} via PrusaLink{count}... {f:.0%}", f)
-
-                    storage = link.upload(job.filename, job.data, progress, self.cancel)
-                    log.info("sent %s via PrusaLink to %s storage /%s", job.filename, base, storage)
-                    job.data = None
-                    sent.append(job)
+                    while True:
+                        def progress(f, job=job, count=count):
+                            self.call(win.update, f"Sending {job.target} via PrusaLink{count}... {f:.0%}", f)
+                        try:
+                            storage = link.upload(job.target, job.data, progress, self.cancel, job.overwrite)
+                            break
+                        except FileExistsError:
+                            # The printer already has this name; we couldn't know in advance.
+                            on_printer.add(job.target.lower())
+                            if job.target != job.filename:  # "New file" was chosen: take the next number
+                                taken = on_printer | {j.target.lower() for j in self.batch if j is not job and j.target}
+                                job.target = numbered_name(job.filename, taken)
+                            else:
+                                job.target = None
+                                if not self.resolve_target(job, on_printer, "the printer"):
+                                    break
+                    if job not in self.batch:
+                        continue
+                    log.info("sent %s via PrusaLink to %s storage /%s", job.target, base, storage)
+                    job.data, job.written = None, True
+                    if job not in sent:
+                        sent.append(job)
                 self.collect()
+            if not sent:
+                self.finish("Nothing was sent (every file was cancelled).", 0.0)
+                return
         except Exception as e:
             log.warning("PrusaLink upload failed after %d of %d files: %s", len(sent), len(self.batch), e)
             done = f" ({len(sent)} of {len(self.batch)} sent)" if sent else ""
