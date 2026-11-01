@@ -73,11 +73,15 @@ def removable_drives():
     return drives
 
 
+def drive_letter_present(letter):
+    return bool(kernel32.GetLogicalDrives() & (1 << (ord(letter) - ord("A"))))
+
+
 def drive_ready(letter):
     """True while the drive's volume is mounted and readable. After Windows' "safe to remove" some
     USB sticks keep their drive letter (with no volume behind it) until unplugged, so the letter
     alone can't tell that the eject finished."""
-    if not kernel32.GetLogicalDrives() & (1 << (ord(letter) - ord("A"))):
+    if not drive_letter_present(letter):
         return False
     return bool(kernel32.GetVolumeInformationW(f"{letter}:\\", None, 0, None, None, None, None, 0))
 
@@ -301,6 +305,9 @@ class Window:
 
 
 class Worker(threading.Thread):
+    """Handles uploads in batches in the single window: every upload that arrives before the drive is
+    ejected joins the current batch; all of it is written, then the drive is ejected once."""
+
     def __init__(self, jobs, ui, test_dir=None):
         super().__init__(daemon=True)
         self.test_dir = test_dir
@@ -309,7 +316,7 @@ class Worker(threading.Thread):
         self.cancel = threading.Event()
         self.via_link = threading.Event()  # "Send via PrusaLink" clicked while waiting for a drive
         self.picked = queue.Queue()
-        self.replaced = None  # name of a waiting job that a newer upload replaced
+        self.batch = []  # accepted uploads (named, data attached) not yet finished
 
     def call(self, fn, *a, **kw):
         self.ui.put(lambda: fn(*a, **kw))
@@ -317,102 +324,115 @@ class Worker(threading.Thread):
     def run(self):
         while True:
             job = self.jobs.get()
+            self.batch = []
+            self.cancel.clear()
             try:
-                self.process(job)
+                self.add(job)
+                self.process_batch()
             except Exception as e:  # keep serving later uploads
-                log.exception("job failed")
+                log.exception("batch failed")
                 self.call(win.update, f"Failed: {e}")
                 self.call(win.set_buttons, [("Close", win.close)])
             finally:
-                job.data = None
+                self.batch = []
 
-    def send_prusalink(self, job, data):
-        """Upload to the printer's own storage over the network instead of a local USB drive."""
-        self.cancel.clear()
-        self.call(win.set_buttons, [("Cancel", self.cancel.set)])
-        try:
-            base, user, password = prusalink_settings()
-            self.call(win.update, f"Connecting to the printer at {base}...", busy=True)
-            link = PrusaLink(base, user, password)
+    # ---- batch bookkeeping
+    def title(self):
+        if len(self.batch) == 1:
+            return self.batch[0].filename
+        return f"{len(self.batch)} files" if self.batch else "USB export"
 
-            def progress(f):
-                self.call(win.update, f"Sending to the printer via PrusaLink... {f:.0%}", f)
+    def files_text(self):
+        n = len(self.batch)
+        return f"{self.batch[0].filename}" if n == 1 else f"{n} files"
 
-            storage = link.upload(job.filename, data, progress, self.cancel)
-        except Exception as e:
-            log.warning("PrusaLink upload of %s failed: %s", job.filename, e)
-            text = "Cancelled. Nothing was sent." if str(e) == "cancelled" else f"PrusaLink: {e}"
-            self.call(win.update, text, 0.0)
-            self.call(win.set_buttons, [("Close", win.close)])
-            return
-        log.info("sent %s via PrusaLink to %s storage /%s", job.filename, base, storage)
-        self.call(win.update, f"Sent to the printer's {storage.upper()} storage via PrusaLink.\n"
-                              "Start the print from the printer.", 1.0)
-        self.call(win.set_buttons, [("Close", win.close)])
-
-    def process(self, job):
-        self.cancel.clear()
-        self.call(win.show, job.filename)
-        self.call(win.set_buttons, [("Cancel", self.cancel.set)])
-        note = f"(Replaces {self.replaced}.)\n" if self.replaced else ""
-        self.replaced = None
+    def add(self, job):
+        """Accept one upload into the batch, asking first if its name doesn't match its content."""
         data, job.data = job.data, None
         kind = "binary G-code" if job.binary else "plain G-code (Export as bgcode is unticked)"
         log.info("received %s: %s, %d bytes", job.filename, kind, len(data))
-        self.call(win.update, note + f"Received {kind}.", 0.0)
-
+        self.call(win.show, job.filename if not self.batch else self.title())
         if not job.name_ok:
             # The picked name's extension doesn't match the content (.bgcode for binary, .gcode
             # for plain G-code): ask before writing.
             expected = ".bgcode" if job.binary else ".gcode"
             fixed = with_extension(job.filename, expected)
+            self.call(win.show, job.filename)
             self.call(win.update, f'"{job.filename}" doesn\'t end in {expected}, but the file is {kind.split(" (")[0]}, '
                                   "so the printer may not read it under that name.")
-            self.call(win.set_buttons, [("Cancel", lambda: self.picked.put(None)),
+            self.call(win.set_buttons, [("Skip file", lambda: self.picked.put(None)),
                                         (f"Keep {os.path.splitext(job.filename)[1]}", lambda: self.picked.put(job.filename)),
                                         (f"Save as {expected}", lambda: self.picked.put(fixed))])
             choice = self.picked.get()
             if choice is None:
-                self.call(win.update, "Cancelled. Nothing was written.")
-                self.call(win.set_buttons, [("Close", win.close)])
+                log.info("skipped %s (user choice)", job.filename)
+                self.call(win.show, self.title())
                 return
             log.info("name %s -> %s (user choice)", job.filename, choice)
             job.filename = choice
-            self.call(win.show, job.filename)
-            self.call(win.set_buttons, [("Cancel", self.cancel.set)])
+        job.data = data
+        self.batch.append(job)
+        self.call(win.show, self.title())
 
-        if self.test_dir:
-            target = os.path.join(self.test_dir, job.filename)
-            with open(target, "wb") as f:
-                f.write(data)
-            log.info("test mode: wrote %s", target)
-            self.call(win.update, f"Test mode: wrote {target}", 1.0)
-            self.call(win.set_buttons, [("Close", win.close)])
+    def collect(self):
+        """Add uploads that arrived meanwhile; True if any did."""
+        added = False
+        while True:
+            try:
+                job = self.jobs.get_nowait()
+            except queue.Empty:
+                return added
+            self.add(job)
+            added = True
+
+    def finish(self, text, progress=1.0):
+        self.call(win.update, text, progress)
+        self.call(win.set_buttons, [("Close", win.close)])
+
+    # ---- the batch
+    def process_batch(self):
+        self.collect()
+        if not self.batch:
+            self.finish("Nothing to write.", 0.0)
             return
 
-        # Wait for a removable drive.
-        drives = removable_drives()
+        if self.test_dir:
+            done = []
+            while len(done) < len(self.batch):
+                for job in [j for j in self.batch if j not in done]:
+                    target = os.path.join(self.test_dir, job.filename)
+                    with open(target, "wb") as f:
+                        f.write(job.data)
+                    log.info("test mode: wrote %s", target)
+                    done.append(job)
+                self.collect()
+            self.finish(f"Test mode: wrote {self.files_text()} to {self.test_dir}")
+            return
+
+        # Wait for a removable drive, collecting further uploads into the batch meanwhile.
         self.via_link.clear()
-        if not drives:
-            # Set once: re-sending it every poll restarted the indeterminate bar's animation.
-            self.call(win.update, "No removable drives found.\nPlug in a USB drive to continue, "
-                                  "or send it to the printer over the network.", busy=True)
+
+        def show_waiting():
+            # Re-sent only when the text changes: the indeterminate bar keeps animating.
+            self.call(win.update, f"{self.files_text()} ready. No removable drives found.\n"
+                                  "Plug in a USB drive, or send to the printer over the network.", busy=True)
             self.call(win.set_buttons, [("Cancel", self.cancel.set),
                                         ("Send via PrusaLink", self.via_link.set)])
+
+        drives = removable_drives()
+        if not drives:
+            show_waiting()
         while not drives:
             if self.cancel.wait(1.0):
-                self.call(win.update, "Cancelled. Nothing was written.")
-                self.call(win.set_buttons, [("Close", win.close)])
+                self.finish("Cancelled. Nothing was written.", 0.0)
                 return
             if self.via_link.is_set():
-                self.send_prusalink(job, data)
+                self.send_prusalink()
                 return
-            if not self.jobs.empty():
-                # A newer upload arrived while this one waited: it replaces this one.
-                log.info("%s replaced by a newer upload before a drive was plugged in", job.filename)
-                self.replaced = job.filename
-                return
+            if self.collect():
+                show_waiting()
             drives = removable_drives()
+
         if len(drives) == 1:
             letter, label = drives[0]
         else:
@@ -421,40 +441,102 @@ class Worker(threading.Thread):
                                         for d, lbl in drives] + [("Cancel", lambda: self.picked.put(None))])
             letter = self.picked.get()
             if letter is None:
-                self.call(win.update, "Cancelled. Nothing was written.")
-                self.call(win.set_buttons, [("Close", win.close)])
+                self.finish("Cancelled. Nothing was written.", 0.0)
                 return
             label = dict(drives).get(letter, "")
         name = f"{letter}: ({label})" if label else f"{letter}:"
         self.call(win.set_buttons, [])
 
-        # Write to the drive root.
+        # Write every file of the batch, including uploads that arrive while copying.
+        written = []
+        while len(written) < len(self.batch):
+            for job in [j for j in self.batch if j not in written]:
+                self.write_file(job, letter, name, len(written) + 1)
+                written.append(job)
+            self.collect()
+
+        # Eject once, then wait for the stick to be pulled out.
+        self.call(win.update, f"Ejecting {name}...", busy=True)
+        if eject(letter):
+            # "Upload" and "Upload and Print" behave the same: prints are started on the printer.
+            what = "is" if len(self.batch) == 1 else "are"
+            self.finish(f"Done. {self.files_text()} {what} on the drive and it was ejected.\n"
+                        "You can unplug it now.")
+            log.info("ejected %s", letter)
+            self.close_when_unplugged(letter)
+        else:
+            self.finish(f"{self.files_text()} written, but {name} could not be ejected "
+                        "(something may still be using it). Eject it from the taskbar before unplugging.")
+            log.warning("eject failed for %s", letter)
+
+    def write_file(self, job, letter, name, index):
         target = os.path.join(f"{letter}:\\", job.filename)
-        self.call(win.update, f"Copying to {name}...", 0.0)
-        tmp = target + ".part"
+        count = f" ({index} of {len(self.batch)})" if len(self.batch) > 1 else ""
+        self.call(win.show, self.title())
+        data, tmp = job.data, target + ".part"
         with open(tmp, "wb") as f:
             step = 1 << 20
             for off in range(0, len(data), step):
                 f.write(data[off:off + step])
-                self.call(win.update, f"Copying to {name}... {min(1.0, (off + step) / len(data)):.0%}",
-                          min(1.0, (off + step) / len(data)))
+                frac = min(1.0, (off + step) / len(data))
+                self.call(win.update, f"Copying {job.filename} to {name}{count}... {frac:.0%}", frac)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, target)
+        job.data = None
         log.info("wrote %s", target)
 
-        # Eject.
-        self.call(win.update, f"Ejecting {name}...", busy=True)
-        if eject(letter):
-            # "Upload" and "Upload and Print" behave the same: the print is started on the printer.
-            self.call(win.update, f"Done. {job.filename} is on the drive and it was ejected.\n"
-                                  "You can unplug it now.", 1.0)
-            log.info("ejected %s", letter)
-        else:
-            self.call(win.update, f"{job.filename} was written, but {name} could not be ejected "
-                                  "(something may still be using it). Eject it from the taskbar before unplugging.", 1.0)
-            log.warning("eject failed for %s", letter)
-        self.call(win.set_buttons, [("Close", win.close)])
+    def send_prusalink(self):
+        """Upload the batch to the printer's own storage over the network instead of a USB drive."""
+        self.cancel.clear()
+        self.call(win.set_buttons, [("Cancel", self.cancel.set)])
+        sent = []
+        try:
+            base, user, password = prusalink_settings()
+            self.call(win.update, f"Connecting to the printer at {base}...", busy=True)
+            link = PrusaLink(base, user, password)
+            storage = ""
+            while len(sent) < len(self.batch):
+                for job in [j for j in self.batch if j not in sent]:
+                    count = f" ({len(sent) + 1} of {len(self.batch)})" if len(self.batch) > 1 else ""
+
+                    def progress(f, job=job, count=count):
+                        self.call(win.update, f"Sending {job.filename} via PrusaLink{count}... {f:.0%}", f)
+
+                    storage = link.upload(job.filename, job.data, progress, self.cancel)
+                    log.info("sent %s via PrusaLink to %s storage /%s", job.filename, base, storage)
+                    job.data = None
+                    sent.append(job)
+                self.collect()
+        except Exception as e:
+            log.warning("PrusaLink upload failed after %d of %d files: %s", len(sent), len(self.batch), e)
+            done = f" ({len(sent)} of {len(self.batch)} sent)" if sent else ""
+            text = "Cancelled." if str(e) == "cancelled" else f"PrusaLink: {e}"
+            self.finish(text + done, 0.0)
+            return
+        what = "is" if len(sent) == 1 else "are"
+        self.finish(f"Done. {self.files_text()} {what} on the printer's {storage.upper()} storage (via PrusaLink).\n"
+                    "Start the print from the printer.")
+
+    def close_when_unplugged(self, letter, timeout=600):
+        """Close the window once the ejected stick is physically removed (its drive letter goes away).
+        Sticks whose letter already vanished at eject can't show that, so close after a few seconds.
+        A newer upload stops the wait (the run loop then starts a new batch in the same window); so
+        does the timeout (the window then stays, with Close)."""
+        if not drive_letter_present(letter):
+            time.sleep(4)
+            if self.jobs.empty():
+                self.call(win.close)
+            return
+        end = time.time() + timeout
+        while time.time() < end:
+            if not self.jobs.empty():
+                return
+            if not drive_letter_present(letter):
+                log.info("%s: unplugged", letter)
+                self.call(win.close)
+                return
+            time.sleep(0.5)
 
 
 # ------------------------------------------------------------------ fake OctoPrint
