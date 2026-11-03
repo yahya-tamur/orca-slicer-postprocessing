@@ -1,52 +1,45 @@
 # Orca Slicer → Prusa binary G-code and USB
 
-An Orca Slicer plugin for Prusa printers (made for the CORE One) on Windows:
+An Orca Slicer plugin for Prusa printers (made for the CORE One) on Windows. It gives Orca what PrusaSlicer has for these printers:
 
-- **Binary G-code.** Orca can't write Prusa's binary G-code (`.bgcode`), which is smaller and loads faster on the printer. The plugin converts Orca's G-code to `.bgcode` after slicing, with the same result PrusaSlicer would produce.
-- **Print button → USB stick.** Orca's Print / Upload button sends the file to a small helper on your PC instead of a networked printer. The helper waits for a USB stick, writes the file to it, ejects the stick and tells you when to unplug it. Nothing is left on the PC.
+- **Binary G-code.** Orca can't write Prusa's binary G-code (`.bgcode`), which is smaller and loads faster on the printer. The plugin converts after slicing, with the same result PrusaSlicer would produce.
+- **Print straight to a USB stick.** Orca's Print button hands the file to a small helper on your PC, which writes it to a USB stick and ejects it, then tells you when to unplug. It can also send the file to the printer over the network (PrusaLink) and start the print.
+- **Camera (optional).** Adds a live camera view to PrusaLink's page in Orca's Device tab.
 
-What you'll see in Orca:
-
-| | Result |
-|---|---|
-| **Export G-code**, file name ends in `.bgcode` | binary G-code |
-| **Export G-code**, any other name | plain G-code, unchanged |
-| **Print / Upload** | binary G-code, written to a USB stick |
-
-To get plain G-code for a while, untick **Export as bgcode** under Process → Others → Slicing Pipeline Plugin; Print then writes plain `.gcode` to the stick. The plugin ticks it again when a project is opened or the process preset changes, so projects and presets never need editing.
-
-The helper's window also handles:
-
-- several uploads in a row: they all go on the stick, with a single eject
-- name clashes: Overwrite, New file or Cancel
-- file names whose extension doesn't match the file type
-- **Send via PrusaLink:** sends to the printer over the network instead (not yet tested with a real printer)
+To get plain G-code for a while, untick **Export as bgcode** under Process → Others → Slicing Pipeline Plugin. It's ticked again when you open a project or change the process preset.
 
 ## Installing
 
-Needs Windows, Orca Slicer 2.5 or newer (for its Python plugins) and Python 3. Only the Python standard library is used.
+You need Windows, Orca Slicer 2.5 or newer, Python 3 (standard library only), and ffmpeg for the camera.
 
 1. **Get the code.** Clone this repository somewhere permanent.
-2. **Point the plugin at it.** In `orca_plugin/usb_bgcode_export/`, copy `local_config.example.json` to `local_config.json` and set `project` to the folder you cloned into and `pythonw` to your `pythonw.exe`. Variables like `%USERPROFILE%` work. This file is git-ignored.
-3. **Install the plugin.** With Orca closed, copy `usb_bgcode_export.py` and `local_config.json` into `%APPDATA%\OrcaSlicer\orca_plugins\usb_bgcode_export\`. Copy them again after changing either one.
-4. **Enable it.** Start Orca, enable **USB bgcode export** in the Plugins dialog, and click **Allow** when Orca asks whether the plugin may run the helper and the converter.
-5. **Set up the printer.** In the printer's connection settings, set host type **OctoPrint**, address `127.0.0.1:51200`, and any API key. To get `.bgcode` names by default, end the process preset's file name format in `.bgcode`.
+2. **Install the plugin.** In Orca's **Plugins** dialog, click the arrow next to **Install plugin**, choose **Install local plugin**, and pick `orca_plugin/usb_bgcode_export/usb_bgcode_export.py` from the repository. Then tick **Activate** for **USB bgcode export**.
+3. **Fill in its settings.** With **USB bgcode export** selected in the Plugins dialog, choose **Config** in the menu at the bottom, set these values in the JSON, and click **Save**. Write paths with `/` or `\\`.
 
-The helper starts and stops with Orca. Its log is `%LOCALAPPDATA%\OrcaUsbBgcode\helper.log`.
+   | Setting | Value |
+   |---|---|
+   | `camera` | optional: the camera's RTSP address (step 6) |
+   | `ffmpeg` | optional: the path to `ffmpeg.exe`, if it isn't on the PATH |
+   | `printer` | the printer's address, for example `http://192.168.1.40` (on the printer under Settings → Network). USB still works without this setting. |
+   | `printer_preset` | your printer's name in Orca's printer list |
+   | `project` | the folder you cloned into, for example `C:/Users/you/orca_slicer_to_prusa_usb` |
+   | `pythonw` | your `pythonw.exe` (variables like `%LOCALAPPDATA%` work) |
 
-The converter also works on its own:
+4. **Restart Orca** and click **Allow** when it asks to run the helper and the converter.
+5. **Connect the printer to the helper.** Click **Connection** above the printer preset to open the **Physical Printer** dialog, and set:
 
-```
-python converter/bgcode.py print.gcode [print.bgcode]
-```
+   | Field | Value |
+   |---|---|
+   | **Host Type** | `Octo/Klipper` |
+   | **Hostname, IP or URL** | `http://127.0.0.1:51200` |
+   | **Device UI** | `http://127.0.0.1:51201` |
+   | **API Key / Password** | the printer's PrusaLink password (on the printer under Settings → Network → PrusaLink) |
 
-## Details
+6. **Camera (optional).** For a Prusa Buddy3D camera: turn on its RTSP stream (in the Prusa app or on its Prusa Connect page), set its resolution to **HD** (Full HD sends no RTSP video), and set `camera` in the plugin's settings to its address, for example `rtsp://192.168.1.50/live`.
+7. **Name files `.bgcode`.** Change the **Filename format** under **Others** in your process presets to end with `.bgcode`.
 
-- **Converter:** written in pure Python from Prusa's [libbgcode](https://github.com/prusa3d/libbgcode) specification and source (AGPL-3.0). Its MeatPack encoding follows libbgcode closely, to stay byte-compatible with PrusaSlicer. On a print exported from both slicers, the G-code, metadata and thumbnails came out identical to PrusaSlicer's `.bgcode`; only the compressed bytes and the timestamp differ. `converter/verify.py` and `converter/compare.py` run those checks.
-- **Ejecting:** the stick is ejected silently through the same Windows call as "Safely Remove Hardware". On USB ports that Windows doesn't treat as removable, the drive is locked, dismounted and its media ejected instead, as Explorer does. If something still has the stick open, the window says it's in use and keeps retrying until it's free.
-- **Plugin API:** learned from the examples in [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer) `v2.5.0-beta` (`sandboxes/`).
-- **Not in the repository:** the libbgcode reference sources and the G-code test files are kept locally only (see `.gitignore`).
+Restart Orca after changing the plugin's settings or the Physical Printer dialog. If something doesn't work, the helper's log is `%LOCALAPPDATA%\OrcaUsbBgcode\helper.log`.
 
 ## License
 
-AGPL-3.0 (see `LICENSE`), the same license as libbgcode, which the converter's MeatPack code follows.
+AGPL-3.0 (see `LICENSE`). The converter follows Prusa's [libbgcode](https://github.com/prusa3d/libbgcode), which has the same license.

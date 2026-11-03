@@ -32,6 +32,8 @@ from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tkinter import ttk
 
+import printer_page
+
 DEFAULT_PORT = 51200
 BGCODE_MAGIC = b"GCDE"  # first bytes of a Prusa binary G-code file
 LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OrcaUsbBgcode")
@@ -40,7 +42,39 @@ logging.basicConfig(filename=os.path.join(LOG_DIR, "helper.log"), level=logging.
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("usb_print_host")
 
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+# Every text the window shows comes from dialogs.json next to this file, so it can be reworded or
+# translated there. A missing or broken file leaves the keys showing as [key] (and is logged).
+DIALOGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dialogs.json")
+try:
+    with open(DIALOGS_FILE, encoding="utf-8") as fh:
+        DIALOGS = json.load(fh)
+except Exception as e:
+    log.error("can't read %s: %s", DIALOGS_FILE, e)
+    DIALOGS = {}
+
+
+def t(key, **values):
+    """The dialog text for key, its lines joined and {placeholders} filled in."""
+    text = DIALOGS.get(key)
+    if text is None:
+        log.warning("dialogs.json has no %s", key)
+        return f"[{key}]"
+    if isinstance(text, list):
+        text = "\n".join(text)
+    try:
+        return text.format(**values)
+    except (KeyError, IndexError, ValueError) as e:
+        log.warning("dialogs.json %s: bad placeholder %s", key, e)
+        return text
+
+
+def count_word(n):
+    """Two, Three ... Ten (from dialogs.json); digits above that."""
+    words = DIALOGS.get("count_words", [])
+    return words[n] if n < len(words) else str(n)
+
+
+kernel32 =ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
 kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
@@ -332,23 +366,35 @@ def numbered_name(name, taken):
 
 
 # ------------------------------------------------------------------ PrusaLink (network alternative)
-# Address and login come from the Orca printer preset, as entered there by the user: print_host_webui
-# (the printer's own address; print_host points at this helper), printhost_user, printhost_password.
-# They are read when the button is used and never stored or logged here.
-PRINTER_PRESET = os.path.join(os.environ.get("APPDATA", ""), "OrcaSlicer", "user", "default", "machine",
-                              "Prusa CORE One+ Gen 2 0.4 HF.json")
+# The printer's address is "printer" in the plugin's settings (printer_page.load_config), or else the
+# preset's print_host_webui (unless that points at the printer page on this PC, see printer_page.py). The
+# login comes from the Orca printer preset ("printer_preset" in the plugin's settings), as entered there
+# by the user: the PrusaLink password
+# in the Physical Printer dialog's "API Key / Password" field (printhost_apikey); if that's empty,
+# printhost_password, which is set when the preset used the PrusaLink host type. Read when needed,
+# never stored or logged here.
+DEFAULT_PRINTER_PRESET = "Prusa CORE One+ Gen 2 0.4 HF"
+
+
+def printer_preset_path():
+    name = printer_page.load_config().get("printer_preset") or DEFAULT_PRINTER_PRESET
+    return os.path.join(os.environ.get("APPDATA", ""), "OrcaSlicer", "user", "default", "machine", name + ".json")
 
 
 def prusalink_settings():
-    """(base_url, user, password) from the Orca printer preset; PRUSALINK_URL overrides the address (tests)."""
-    with open(PRINTER_PRESET, encoding="utf-8") as f:
+    """(base_url, user, password); PRUSALINK_URL overrides the address (tests)."""
+    with open(printer_preset_path(), encoding="utf-8") as f:
         preset = json.load(f)
-    base = os.environ.get("PRUSALINK_URL") or preset.get("print_host_webui") or ""
+    webui = preset.get("print_host_webui") or ""
+    if "127.0.0.1" in webui or "localhost" in webui:
+        webui = ""  # the Device tab shows the printer page served here, not the printer itself
+    base = os.environ.get("PRUSALINK_URL") or printer_page.load_config().get("printer") or webui
     if base and "://" not in base:
         base = "http://" + base
     if not base or "127.0.0.1" in base or "localhost" in base:
-        raise RuntimeError("No PrusaLink address in the printer preset (print_host_webui).")
-    return base.rstrip("/"), preset.get("printhost_user") or "maker", preset.get("printhost_password") or ""
+        raise RuntimeError(t("error_no_address"))
+    password = preset.get("printhost_apikey") or preset.get("printhost_password") or ""
+    return base.rstrip("/"), preset.get("printhost_user") or "maker", password
 
 
 class PrusaLink:
@@ -407,7 +453,7 @@ class PrusaLink:
                     self.challenge = dict(re.findall(r'(\w+)="?([^",]*)"?', header))
                     self.nc = 0
                     if not self.challenge.get("nonce"):
-                        raise RuntimeError("PrusaLink asked for a login it doesn't describe: " + header)
+                        raise RuntimeError(t("error_login_unknown", detail=header))
                     continue  # retry with the login (upload() GETs first, so a PUT body is rarely resent)
                 return resp.status, data
             finally:
@@ -418,13 +464,13 @@ class PrusaLink:
         """Path of the printer's writable storage (its USB stick), e.g. "/usb"."""
         status, data = self._request("GET", "/api/v1/storage")
         if status == 401:
-            raise RuntimeError("PrusaLink rejected the login. Check the password in Orca's printer connection settings.")
+            raise RuntimeError(t("error_login"))
         if status != 200:
-            raise RuntimeError(f"PrusaLink storage list failed (HTTP {status}).")
+            raise RuntimeError(t("error_storage_list", status=status))
         for s in json.loads(data).get("storage_list", []):
             if s.get("available", True) and not s.get("read_only", s.get("ro", False)):
                 return s["path"]
-        raise RuntimeError("The printer has no writable storage. Is a USB stick plugged into the printer?")
+        raise RuntimeError(t("error_no_storage"))
 
     def upload(self, name, data, progress=None, cancel=None, overwrite=False):
         """PUT the file into the printer's storage (not started). Raises FileExistsError when the
@@ -443,12 +489,24 @@ class PrusaLink:
                 raise FileExistsError(name)
             detail = next((m for m in ("Another transfer in progress", "File is busy") if m.lower() in text.lower()),
                           text.strip()[:200] or "conflict (HTTP 409)")
-            raise RuntimeError(f"The printer refused {name}: {detail}")
+            raise RuntimeError(t("error_refused", file=name, detail=detail))
         if status == 401:
-            raise RuntimeError("PrusaLink rejected the login. Check the password in Orca's printer connection settings.")
+            raise RuntimeError(t("error_login"))
         if status not in (200, 201, 204):
-            raise RuntimeError(f"PrusaLink upload failed (HTTP {status}): {body[:200].decode('latin-1', 'replace')}")
+            raise RuntimeError(t("error_upload", status=status, detail=body[:200].decode("latin-1", "replace")))
         return storage
+
+    def start_print(self, storage, name):
+        """Start printing a file already in the printer's storage, as the Print button of its web
+        page does: POST to the file's address, no body."""
+        uri = f"/api/v1/files/{urllib.parse.quote(storage.strip('/'))}/{urllib.parse.quote(name)}"
+        status, body = self._request("POST", uri, headers={"Content-Type": "application/json"})
+        if status == 409:
+            raise RuntimeError(t("error_printer_busy"))
+        if status == 401:
+            raise RuntimeError(t("error_login"))
+        if status not in (200, 201, 204):
+            raise RuntimeError(t("error_start", status=status, detail=body[:200].decode("latin-1", "replace")))
 
 
 # ------------------------------------------------------------------ jobs
@@ -461,6 +519,11 @@ class Job:
         self.target = None       # name at the destination, decided when it is written
         self.overwrite = False   # the user chose Overwrite for a name taken there
         self.written = False
+        self.updated_at = None   # "15:55" when a same-name upload replaced this one's content
+        self.progress = 0.0      # share written so far, while copying or sending
+
+
+FILE_LINE_CHARS = 56  # a file's line in the window is kept to this length (longer names are shortened)
 
 
 class Window:
@@ -474,10 +537,11 @@ class Window:
     def show(self, filename):
         if self.top is None or not self.top.winfo_exists():
             self.top = tk.Toplevel(self.root)
-            self.top.title("USB export")
+            self.top.title(t("window_title"))
             self.top.resizable(False, False)
             self.top.protocol("WM_DELETE_WINDOW", self.close)
             # Fixed size: every area has a fixed height so changing text or buttons never resizes it.
+            # The text area fits 4 lines; files_block keeps long batches within that.
             self.top.geometry("440x210")
             frm = ttk.Frame(self.top, padding=16)
             frm.pack(fill="both", expand=True)
@@ -552,20 +616,50 @@ class Worker(threading.Thread):
                 self.process_batch()
             except Exception as e:  # keep serving later uploads
                 log.exception("batch failed")
-                self.call(win.update, f"Failed: {e}")
-                self.call(win.set_buttons, [("Close", win.close)])
+                self.finish(t("failed", error=e), 0.0)
             finally:
                 self.batch = []
 
     # ---- batch bookkeeping
     def title(self):
         if len(self.batch) == 1:
-            return self.batch[0].filename
-        return f"{len(self.batch)} files" if self.batch else "USB export"
+            return t("heading_one", file=self.batch[0].filename)
+        return t("heading_many", count=count_word(len(self.batch))) if self.batch else t("window_title")
 
-    def files_text(self):
-        n = len(self.batch)
-        return f"{self.batch[0].filename}" if n == 1 else f"{n} files"
+    def files_block(self, room, writing=False, plain=False):
+        """The batch for {files}, one file per line, in at most `room` lines (what the dialog
+        leaves free of the window's 4). writing: files not yet written show their progress,
+        written ones show done. A file replaced by a newer upload (and not yet written again) shows
+        when. plain: names only, for a finished batch.
+        More files than room: the unfinished files with the most progress (a replaced one first
+        among ties), then "N files total, M done"; plain, just "N files done."."""
+        jobs = self.batch
+
+        def render(j, name):
+            if plain:
+                return t("file_line", file=name)
+            if writing and j.written:
+                return t("file_line_done", file=name)
+            text = t("file_line_progress", file=name, percent=f"{j.progress:.0%}") if writing else t("file_line", file=name)
+            return text + t("file_updated_suffix", time=j.updated_at) if j.updated_at else text
+
+        def line(j):
+            name = j.target or j.filename
+            text = render(j, name)
+            if len(text) > FILE_LINE_CHARS:  # shorten the name in the middle (keeping its end) so the line doesn't wrap
+                keep = max(8, len(name) - (len(text) - FILE_LINE_CHARS) - 1)
+                text = render(j, name[:keep - keep // 3] + "…" + name[len(name) - keep // 3:])
+            return text
+
+        if len(jobs) <= room:
+            return "\n".join(line(j) for j in jobs)
+        if plain:
+            return t("files_all_done", count=len(jobs))
+        # Stable sort: otherwise ties keep upload order.
+        pending = sorted((j for j in jobs if not j.written), key=lambda j: (-j.progress, j.updated_at is None))
+        lines = [line(j) for j in pending[:room - 1]]
+        lines.append(t("files_summary", total=len(jobs), done=len(jobs) - len(pending)))
+        return "\n".join(lines)
 
     def add(self, job):
         """Accept one upload into the batch, asking first if its name doesn't match its content."""
@@ -579,11 +673,10 @@ class Worker(threading.Thread):
             expected = ".bgcode" if job.binary else ".gcode"
             fixed = with_extension(job.filename, expected)
             self.call(win.show, job.filename)
-            self.call(win.update, f'"{job.filename}" doesn\'t end in {expected}, but the file is {kind.split(" (")[0]}, '
-                                  "so the printer may not read it under that name.")
-            self.call(win.set_buttons, [("Cancel", lambda: self.picked.put(None)),
-                                        (f"Keep {os.path.splitext(job.filename)[1]}", lambda: self.picked.put(job.filename)),
-                                        (f"Save as {expected}", lambda: self.picked.put(fixed))])
+            self.call(win.update, t("name_mismatch", file=job.filename, ext=expected))
+            self.call(win.set_buttons, [(t("button_cancel"), lambda: self.picked.put(None)),
+                                        (t("button_keep_name"), lambda: self.picked.put(job.filename)),
+                                        (t("button_save_as", ext=expected), lambda: self.picked.put(fixed))])
             choice = self.picked.get()
             if choice is None:
                 log.info("cancelled %s (user choice)", job.filename)
@@ -598,13 +691,14 @@ class Worker(threading.Thread):
         if earlier is not None:
             if earlier.written:
                 earlier.overwrite = True  # its file is ours now; rewrite it without asking
-            earlier.data, earlier.binary, earlier.written = job.data, job.binary, False
+            earlier.data, earlier.binary, earlier.written, earlier.progress = job.data, job.binary, False, 0.0
+            earlier.updated_at = time.strftime("%H:%M")  # shown on its line, so the upload visibly arrived
             log.info("%s overwrites the earlier upload of the same name in this batch", job.filename)
         else:
             self.batch.append(job)
         self.call(win.show, self.title())
 
-    def resolve_target(self, job, existing, place="the drive"):
+    def resolve_target(self, job, existing, place="drive"):
         """Pick the name job gets at its destination. existing: lower-case names already there.
         A name taken there or by another file of this batch asks: Overwrite / Save as "name (k)" /
         Cancel (drops just this file). Returns False when cancelled."""
@@ -614,12 +708,12 @@ class Worker(threading.Thread):
             job.target = job.filename
             return True
         new = numbered_name(job.filename, existing | set(others))
-        where = f"is already on {place}" if key in existing else "is already used by another file in this batch"
+        text = f"name_taken_{place}" if key in existing else "name_taken_batch"  # place: drive / printer
         self.call(win.show, job.filename)
-        self.call(win.update, f'"{job.filename}" {where}.\nOverwrite it, or save the new file as "{new}"?')
-        self.call(win.set_buttons, [("Cancel", lambda: self.picked.put("cancel")),
-                                    ("Overwrite", lambda: self.picked.put("overwrite")),
-                                    ("New file", lambda: self.picked.put("new"))])
+        self.call(win.update, t(text, file=job.filename, new=new))
+        self.call(win.set_buttons, [(t("button_cancel"), lambda: self.picked.put("cancel")),
+                                    (t("button_overwrite"), lambda: self.picked.put("overwrite")),
+                                    (t("button_new_file"), lambda: self.picked.put("new"))])
         choice = self.picked.get()
         self.call(win.set_buttons, [])
         log.info("name conflict for %s: %s", job.filename, choice)
@@ -650,18 +744,18 @@ class Worker(threading.Thread):
 
     def finish(self, text, progress=1.0):
         self.call(win.update, text, progress)
-        self.call(win.set_buttons, [("Close", win.close)])
+        self.call(win.set_buttons, [(t("button_close"), win.close)])
 
     # ---- the batch
     def process_batch(self):
         self.collect()
         if not self.batch:
-            self.finish("Nothing to write.", 0.0)
+            self.finish(t("nothing_to_write"), 0.0)
             return
 
         if self.test_dir:  # same naming and writing, into a folder; no drive wait or eject
             if self.write_all(self.test_dir, self.test_dir):
-                self.finish(f"Test mode: wrote {self.files_text()} to {self.test_dir}")
+                self.finish(t("test_mode_done", folder=self.test_dir, files=self.files_block(3, plain=True)))
             return
 
         # Wait for a removable drive, collecting further uploads into the batch meanwhile.
@@ -669,17 +763,16 @@ class Worker(threading.Thread):
 
         def show_waiting():
             # Re-sent only when the text changes: the indeterminate bar keeps animating.
-            self.call(win.update, f"{self.files_text()} ready. No removable drives found.\n"
-                                  "Plug in a USB drive, or send to the printer over the network.", busy=True)
-            self.call(win.set_buttons, [("Cancel", self.cancel.set),
-                                        ("Send via PrusaLink", self.via_link.set)])
+            self.call(win.update, t("waiting", files=self.files_block(2)), busy=True)
+            self.call(win.set_buttons, [(t("button_cancel"), self.cancel.set),
+                                        (t("button_send_prusalink"), self.via_link.set)])
 
         drives = removable_drives()
         if not drives:
             show_waiting()
         while not drives:
             if self.cancel.wait(1.0):
-                self.finish("Cancelled. Nothing was written.", 0.0)
+                self.finish(t("usb_cancelled"), 0.0)
                 return
             if self.via_link.is_set():
                 self.send_prusalink()
@@ -691,12 +784,13 @@ class Worker(threading.Thread):
         if len(drives) == 1:
             letter, label = drives[0]
         else:
-            self.call(win.update, "Several removable drives found. Which one?")
-            self.call(win.set_buttons, [(f"{d}: {lbl or 'USB drive'}", lambda d=d: self.picked.put(d))
-                                        for d, lbl in drives] + [("Cancel", lambda: self.picked.put(None))])
+            self.call(win.update, t("choose_drive"))
+            self.call(win.set_buttons, [(t("button_drive", drive=f"{d}: {lbl or t('drive_unnamed')}"),
+                                         lambda d=d: self.picked.put(d)) for d, lbl in drives]
+                                       + [(t("button_cancel"), lambda: self.picked.put(None))])
             letter = self.picked.get()
             if letter is None:
-                self.finish("Cancelled. Nothing was written.", 0.0)
+                self.finish(t("usb_cancelled"), 0.0)
                 return
             label = dict(drives).get(letter, "")
         name = f"{letter}: ({label})" if label else f"{letter}:"
@@ -707,7 +801,7 @@ class Worker(threading.Thread):
 
         # Eject (retrying while the drive is in use), then wait for the stick to be pulled out.
         while True:
-            self.call(win.update, f"Ejecting {name}...\nDon't unplug it yet.", busy=True)
+            self.call(win.update, t("ejecting", drive=name), busy=True)
             shown = [0]
 
             def waiting(seconds, reason):
@@ -715,26 +809,21 @@ class Worker(threading.Thread):
                 # is in use, with a counter that ticks every second between the attempts.
                 if (reason or seconds >= 10) and int(seconds) != shown[0]:
                     shown[0] = int(seconds)
-                    m, s = divmod(int(seconds), 60)
-                    elapsed = f"{s}s" if not m else f"{m}m" + (f" {s}s" if s else "")  # 45s, 1m, 1m 34s
-                    self.call(win.update, f"Trying to eject {name}: the drive is still in use ({elapsed}).\n"
-                                          "Close any Explorer window or file open from it. "
-                                          "Don't unplug it yet.", busy=True)
+                    m, s = divmod(int(seconds), 60)  # 45s, 1m, 1m 34s
+                    elapsed = t("elapsed_seconds", s=s) if not m else \
+                        t("elapsed_minutes_seconds", m=m, s=s) if s else t("elapsed_minutes", m=m)
+                    self.call(win.update, t("eject_in_use", drive=name, elapsed=elapsed), busy=True)
 
             if eject(letter, waiting=waiting):
                 # "Upload" and "Upload and Print" behave the same: prints are started on the printer.
-                what = "is" if len(self.batch) == 1 else "are"
-                self.finish(f"Done. {self.files_text()} {what} on the drive and it was ejected.\n"
-                            "You can unplug it now.")
+                self.finish(t("usb_done", drive=name, files=self.files_block(2, plain=True)))
                 log.info("ejected %s", letter)
                 self.close_when_unplugged(letter)
                 return
             log.warning("eject of %s still not done after the timeout", letter)
-            self.call(win.update, f"{name} still can't be ejected; something may be using it "
-                                  "(an open Explorer window or another program).\n"
-                                  "Close it and try again. Don't unplug the drive yet.", 0.0)
-            self.call(win.set_buttons, [("Close", lambda: self.picked.put(False)),
-                                        ("Try again", lambda: self.picked.put(True))])
+            self.call(win.update, t("eject_failed", drive=name), 0.0)
+            self.call(win.set_buttons, [(t("button_close"), lambda: self.picked.put(False)),
+                                        (t("button_try_again"), lambda: self.picked.put(True))])
             again = self.picked.get()
             self.call(win.set_buttons, [])
             if not again:
@@ -756,17 +845,16 @@ class Worker(threading.Thread):
                     continue  # dropped by an earlier conflict prompt in this round
                 if job.target is None and not self.resolve_target(job, {n.lower() for n in os.listdir(root)}):
                     continue
-                self.write_file(job, root, name, sum(j.written for j in self.batch) + 1)
+                self.write_file(job, root, name)
                 job.written = True
-            self.collect()
+                self.collect()  # after each file, so a newer upload shows up at once
         if not self.batch:
-            self.finish("Nothing was written (every file was cancelled).", 0.0)
+            self.finish(t("nothing_written"), 0.0)
             return False
         return True
 
-    def write_file(self, job, root, name, index):
+    def write_file(self, job, root, name):
         target = os.path.join(root, job.target)
-        count = f" ({index} of {len(self.batch)})" if len(self.batch) > 1 else ""
         self.call(win.show, self.title())
         data, tmp = job.data, target + ".part"
         with open(tmp, "wb") as f:
@@ -777,8 +865,8 @@ class Worker(threading.Thread):
                 f.write(data[off:off + step])
                 f.flush()
                 os.fsync(f.fileno())
-                frac = min(1.0, (off + step) / len(data))
-                self.call(win.update, f"Copying {job.target} to {name}{count}... {frac:.0%}", frac)
+                job.progress = frac = min(1.0, (off + step) / len(data))
+                self.call(win.update, t("copying", drive=name, files=self.files_block(3, writing=True)), frac)
         os.replace(tmp, target)
         job.data = None
         log.info("wrote %s", target)
@@ -786,11 +874,11 @@ class Worker(threading.Thread):
     def send_prusalink(self):
         """Upload the batch to the printer's own storage over the network instead of a USB drive."""
         self.cancel.clear()
-        self.call(win.set_buttons, [("Cancel", self.cancel.set)])
+        self.call(win.set_buttons, [(t("button_cancel"), self.cancel.set)])
         sent = []
         try:
             base, user, password = prusalink_settings()
-            self.call(win.update, f"Connecting to the printer at {base}...", busy=True)
+            self.call(win.update, t("connecting", address=base), busy=True)
             link = PrusaLink(base, user, password)
             storage = ""
             on_printer = set()  # lower-case names the printer reported as taken (409)
@@ -803,12 +891,12 @@ class Worker(threading.Thread):
                 for job in pending:
                     if job not in self.batch:
                         continue  # dropped by an earlier conflict prompt in this round
-                    if job.target is None and not self.resolve_target(job, on_printer, "the printer"):
+                    if job.target is None and not self.resolve_target(job, on_printer, "printer"):
                         continue
-                    count = f" ({len(sent) + 1} of {len(self.batch)})" if len(self.batch) > 1 else ""
                     while True:
-                        def progress(f, job=job, count=count):
-                            self.call(win.update, f"Sending {job.target} via PrusaLink{count}... {f:.0%}", f)
+                        def progress(f, job=job):
+                            job.progress = f
+                            self.call(win.update, t("sending_printer", files=self.files_block(3, writing=True)), f)
                         try:
                             storage = link.upload(job.target, job.data, progress, self.cancel, job.overwrite)
                             break
@@ -820,7 +908,7 @@ class Worker(threading.Thread):
                                 job.target = numbered_name(job.filename, taken)
                             else:
                                 job.target = None
-                                if not self.resolve_target(job, on_printer, "the printer"):
+                                if not self.resolve_target(job, on_printer, "printer"):
                                     break
                     if job not in self.batch:
                         continue
@@ -828,19 +916,40 @@ class Worker(threading.Thread):
                     job.data, job.written = None, True
                     if job not in sent:
                         sent.append(job)
-                self.collect()
+                    self.collect()  # after each file, so a newer upload shows up at once
             if not sent:
-                self.finish("Nothing was sent (every file was cancelled).", 0.0)
+                self.finish(t("nothing_sent"), 0.0)
                 return
         except Exception as e:
             log.warning("PrusaLink upload failed after %d of %d files: %s", len(sent), len(self.batch), e)
-            done = f" ({len(sent)} of {len(self.batch)} sent)" if sent else ""
-            text = "Cancelled." if str(e) == "cancelled" else f"PrusaLink: {e}"
-            self.finish(text + done, 0.0)
+            if str(e) == "cancelled":  # the files already sent show done
+                self.finish(t("send_cancelled", files=self.files_block(3, writing=True)), 0.0)
+            else:  # no room for the files next to an error of up to two lines
+                self.finish(t("send_failed", done=len(sent), total=len(self.batch), error=e), 0.0)
             return
-        what = "is" if len(sent) == 1 else "are"
-        self.finish(f"Done. {self.files_text()} {what} on the printer's {storage.upper()} storage (via PrusaLink).\n"
-                    "Start the print from the printer.")
+        name = sent[0].target  # with several files, the first one sent is offered
+        if len(sent) == 1:
+            text = t("printer_done_one", file=name)
+        else:
+            text = t("printer_done_many", count=count_word(len(sent)), file=name)
+        self.call(win.update, text, 1.0)
+        self.call(win.set_buttons, [
+            (t("button_close"), win.close),
+            (t("button_start_print"), lambda: threading.Thread(target=self.start_print, args=(link, storage, name),
+                                                                daemon=True).start())])
+
+    def start_print(self, link, storage, name):
+        """Start Print button after a PrusaLink send (runs off the Tk thread)."""
+        self.call(win.set_buttons, [])
+        self.call(win.update, t("starting", file=name), busy=True)
+        try:
+            link.start_print(storage, name)
+        except Exception as e:
+            log.warning("starting %s via PrusaLink failed: %s", name, e)
+            self.finish(t("start_failed", file=name, error=e), 0.0)
+            return
+        log.info("started %s via PrusaLink", name)
+        self.finish(t("printing", file=name))
 
     def close_when_unplugged(self, letter, timeout=600):
         """Close the window once the ejected stick is physically removed (its drive letter goes away).
@@ -1020,6 +1129,9 @@ def main():
         return
     log.info("listening on 127.0.0.1:%s (orca pid %s)", args.port, args.orca_pid)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    # The printer's PrusaLink page with the camera, for Orca's Device tab (printer_page.py).
+    threading.Thread(target=printer_page.serve, args=(printer_page.DEFAULT_PORT, prusalink_settings,
+                                                       printer_page.load_config()), daemon=True).start()
 
     root = tk.Tk()
     root.withdraw()
@@ -1040,6 +1152,7 @@ def main():
         watch_orca(args.orca_pid, root)
     root.mainloop()
     server.shutdown()
+    printer_page.stop()
     log.info("stopped")
 
 

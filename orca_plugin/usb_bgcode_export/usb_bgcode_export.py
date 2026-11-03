@@ -5,7 +5,7 @@
 # name = "USB bgcode export"
 # description = "Converts G-code to Prusa .bgcode on Export (for .bgcode names) and on Print/upload; the Print button's helper writes the file to a USB drive and ejects it."
 # author = "local"
-# version = "0.4.0"
+# version = "0.5.0"
 # ///
 """Two capabilities:
 
@@ -28,6 +28,12 @@
 Orca audits subprocess.Popen against the exact command line, so both command lines are fixed (pid
 and file path go in the environment). They and thread creation (preset edits must come from a
 background thread) are requested once via orca.request_permissions().
+
+Settings: every setting (this repository's folder, pythonw.exe, the printer and camera for the
+helper) is the "USB bgcode helper" capability's configuration, edited in Orca's Plugins dialog.
+Orca stores it in orca_plugins/config.json. The command lines must be known while Orca loads the
+plugin (permissions can only be requested then), before get_config() is available, so that file is
+read directly here; the helper reads the same file (its path goes in ORCA_PLUGIN_SETTINGS).
 """
 import json
 import os
@@ -37,33 +43,56 @@ import time
 
 import orca
 
-# Where this repository and pythonw.exe are come from local_config.json next to this file (copy
-# local_config.example.json); %USERPROFILE%-style variables are expanded. The expanded strings must
-# stay identical between runs: Orca's process permission is saved per exact command line.
-CONFIG_NAME = "local_config.json"
+PLUGIN_KEY = "usb_bgcode_export"  # Orca's key for a local plugin: the .py file's stem
+SETTINGS_CAPABILITY = "USB bgcode helper"
+DEFAULT_SETTINGS = {
+    "project": "",         # this repository's folder
+    "pythonw": "",         # pythonw.exe of a Python 3 with tkinter
+    "printer_preset": "",  # the printer preset holding the PrusaLink password
+    "printer": "",         # the printer's address, e.g. http://192.168.1.40
+    "camera": "",          # optional: the camera's RTSP address
+    "ffmpeg": "",          # optional: ffmpeg.exe, if it's not on the PATH
+}
 
 
 def _plugin_dir():
     try:
         return os.path.dirname(os.path.abspath(__file__))
     except NameError:
-        return os.path.join(os.environ["APPDATA"], "OrcaSlicer", "orca_plugins", "usb_bgcode_export")
+        return os.path.join(os.environ["APPDATA"], "OrcaSlicer", "orca_plugins", PLUGIN_KEY)
 
 
-def _load_paths():
-    with open(os.path.join(_plugin_dir(), CONFIG_NAME), encoding="utf-8") as f:
-        cfg = json.load(f)
-    return os.path.expandvars(cfg["project"]), os.path.expandvars(cfg["pythonw"])
+SETTINGS_FILE = os.path.join(os.path.dirname(_plugin_dir()), "config.json")  # orca_plugins/config.json
 
 
+def _load_settings():
+    """This plugin's settings as last saved in Orca's Plugins dialog, over the defaults."""
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            entries = json.load(f).get("config", [])
+    except FileNotFoundError:
+        return settings
+    for entry in entries:
+        if entry.get("plugin_key") == PLUGIN_KEY and entry.get("capability") == SETTINGS_CAPABILITY:
+            settings.update(entry.get("cap_config") or {})
+    return settings
+
+
+# %USERPROFILE%-style variables are expanded and / or \ both work. The resulting strings must stay
+# identical between runs: Orca's process permission is saved per exact command line.
 try:
-    PROJECT, PYTHONW = _load_paths()
+    _settings = _load_settings()
+    if not _settings["project"] or not _settings["pythonw"]:
+        raise ValueError("\"project\" or \"pythonw\" is empty")
+    PROJECT, PYTHONW = (os.path.normpath(os.path.expandvars(_settings[k])) for k in ("project", "pythonw"))
     HELPER_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "usb_print_host.py")]
     CONVERT_COMMAND = [PYTHONW, os.path.join(PROJECT, "helper", "convert_in_place.py")]
     CONFIG_ERROR = ""
-except Exception as e:  # missing or broken config: load anyway and say so instead of crashing Orca's loader
+except Exception as e:  # unset or broken settings: load anyway and say so instead of crashing Orca's loader
     HELPER_COMMAND = CONVERT_COMMAND = None
-    CONFIG_ERROR = f"{CONFIG_NAME} in the plugin folder is missing or invalid ({type(e).__name__}: {e})"
+    CONFIG_ERROR = (f"set \"project\" and \"pythonw\" in the plugin's settings (Plugins dialog, {SETTINGS_CAPABILITY}), "
+                    f"then restart Orca ({type(e).__name__}: {e})")
 CREATE_NO_WINDOW = 0x08000000
 
 PIPELINE_CAPABILITY = "Export as bgcode"
@@ -89,7 +118,10 @@ class UsbBgcodeHelper(orca.script.ScriptPluginCapabilityBase):
     _ensure_lock = threading.Lock()
 
     def get_name(self):
-        return "USB bgcode helper"
+        return SETTINGS_CAPABILITY
+
+    def get_default_config(self):
+        return DEFAULT_SETTINGS  # shown in the Plugins dialog's settings editor
 
     # ---- helper process
     def _start(self):
@@ -97,7 +129,7 @@ class UsbBgcodeHelper(orca.script.ScriptPluginCapabilityBase):
             return "already running"
         if CONFIG_ERROR:
             raise RuntimeError(CONFIG_ERROR)
-        env = dict(os.environ, ORCA_USB_HELPER_PID=str(os.getpid()))
+        env = dict(os.environ, ORCA_USB_HELPER_PID=str(os.getpid()), ORCA_PLUGIN_SETTINGS=SETTINGS_FILE)
         self.proc = subprocess.Popen(HELPER_COMMAND, env=env, creationflags=CREATE_NO_WINDOW, close_fds=True)
         return "started"
 

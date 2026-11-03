@@ -1,14 +1,15 @@
-# Third-party source kept locally for reference only (Prusa Research's libbgcode, AGPL-3.0).
-# See README.md, "Third-party material", for where to get it.
+# Third-party source kept locally for reference only (Prusa Research's libbgcode, AGPL-3.0,
+# from github.com/prusa3d/libbgcode).
 libbgcode_reference/
 
 # G-code test files, local only: copies of PrusaSlicer's resources/test_data (AGPL-3.0) and the
-# user's own prints. See README.md, "Third-party material".
+# user's own prints.
 testdata/*.gcode
 testdata/*.bgcode
 
-# The plugin's local paths (copy orca_plugin/usb_bgcode_export/local_config.example.json)
+# Old settings files with local paths and addresses, no longer read (the settings are in Orca now)
 orca_plugin/usb_bgcode_export/local_config.json
+helper/local_config.json
 
 # Python and editor clutter
 __pycache__/

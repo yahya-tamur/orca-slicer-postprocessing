@@ -1,0 +1,83 @@
+{
+    "_readme": [
+        "Every text the helper's window shows. Edit or translate the values; keep the keys.",
+        "A value is one string, or a list of strings shown as separate lines.",
+        "{placeholders} are filled in by the helper; keep the ones a text uses.",
+        "The window shows 4 lines of text (a long line wraps and takes two).",
+        "{files} becomes one line per file, each written with the file_line_* texts; file_updated_suffix",
+        "is added to the line of a file a newer upload replaced. {files} gets the lines its text leaves:",
+        "2 in waiting and usb_done, 3 in the others. When the files don't fit, it shows the unfinished",
+        "files with the most progress, then files_summary; a finished batch shows files_all_done.",
+        "The helper reads this file when it starts (restart Orca to see changes)."
+    ],
+
+    "window_title": "USB export",
+    "heading_one": "{file}",
+    "heading_many": "{count} files",
+    "count_words": ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten"],
+
+    "file_line": "{file}",
+    "file_line_progress": "{file} {percent}",
+    "file_line_done": "{file} (done)",
+    "file_updated_suffix": " (updated {time})",
+    "files_summary": "{total} files total, {done} done",
+    "files_all_done": "{count} files done.",
+
+    "button_cancel": "Cancel",
+    "button_close": "Close",
+
+    "name_mismatch": "\"{file}\" doesn't end in {ext}, and may not be recognized by the printer.",
+    "button_save_as": "Save as {ext}",
+    "button_keep_name": "Keep name",
+
+    "waiting": ["Sending", "{files}", "Plug in a USB drive."],
+    "button_send_prusalink": "Send via PrusaLink",
+
+    "choose_drive": ["Several USB drives found.", "Which one?"],
+    "button_drive": "{drive}",
+    "drive_unnamed": "USB drive",
+
+    "name_taken_drive": ["\"{file}\" is already on the drive.", "Overwrite it, or save as \"{new}\"?"],
+    "name_taken_printer": ["\"{file}\" is already on the printer.", "Overwrite it, or save as \"{new}\"?"],
+    "name_taken_batch": ["\"{file}\" is already being sent.", "Overwrite it, or save as \"{new}\"?"],
+    "button_new_file": "New file",
+    "button_overwrite": "Overwrite",
+
+    "copying": ["Copying to {drive}", "{files}"],
+    "ejecting": ["Ejecting {drive}", "Don't unplug it yet."],
+    "eject_in_use": ["Ejecting {drive}", "The drive is in use ({elapsed}). Close any Explorer window or file open from it.", "Don't unplug it yet."],
+    "elapsed_seconds": "{s}s",
+    "elapsed_minutes": "{m}m",
+    "elapsed_minutes_seconds": "{m}m {s}s",
+    "eject_failed": ["Couldn't eject {drive}.", "Close any Explorer window or program using it, then try again.", "Don't unplug it yet."],
+    "button_try_again": "Try again",
+    "usb_done": ["Written to {drive}", "{files}", "You can unplug it now."],
+
+    "connecting": ["Connecting to the printer", "{address}"],
+    "sending_printer": ["Sending to the printer", "{files}"],
+    "printer_done_one": ["File written.", "Print {file}?"],
+    "printer_done_many": ["{count} files written.", "Print {file}?"],
+    "button_start_print": "Start Print",
+    "starting": ["Starting", "{file}"],
+    "printing": ["Printing", "{file}", "Follow it on the printer or in Orca's Device tab."],
+    "start_failed": ["Couldn't start", "{file}", "{error}"],
+    "send_failed": ["Couldn't send to the printer ({done} of {total} sent).", "{error}"],
+    "send_cancelled": ["Cancelled.", "{files}"],
+
+    "usb_cancelled": "Cancelled. Nothing was written.",
+    "nothing_written": "Nothing was written.",
+    "nothing_sent": "Nothing was sent.",
+    "nothing_to_write": "Nothing to write.",
+    "failed": ["Failed.", "{error}"],
+    "test_mode_done": ["Test mode: written to {folder}", "{files}"],
+
+    "error_no_address": "No printer address. Set \"printer\" in the plugin's settings in Orca.",
+    "error_login": "The printer rejected the login. Check the password in Orca's printer connection settings.",
+    "error_login_unknown": "The printer asked for an unknown login: {detail}",
+    "error_storage_list": "Couldn't list the printer's storage (HTTP {status}).",
+    "error_no_storage": "The printer has no writable storage. Is a USB stick plugged into the printer?",
+    "error_refused": "The printer refused {file}: {detail}",
+    "error_upload": "Upload failed (HTTP {status}): {detail}",
+    "error_printer_busy": "The printer can't start a print now. It's printing or not ready.",
+    "error_start": "Starting failed (HTTP {status}): {detail}"
+}
