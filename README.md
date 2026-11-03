@@ -13,7 +13,7 @@ To get plain G-code for a while, untick **Export as bgcode** under Process → O
 You need Windows, Orca Slicer 2.5 or newer, Python 3 (standard library only), and ffmpeg for the camera.
 
 1. **Get the code.** Clone this repository somewhere permanent.
-2. **Install the plugin.** In Orca's **Plugins** dialog, click the arrow next to **Install plugin**, choose **Install local plugin**, and pick `orca_plugin/usb_bgcode_export/usb_bgcode_export.py` from the repository. Then tick **Activate** for **USB bgcode export**.
+2. **Install the plugin.** In Orca's **Plugins** dialog, click the arrow next to **Install plugin**, choose **Install local plugin**, and pick `orca_plugin/usb_bgcode_export.py` from the repository. Then tick **Activate** for **USB bgcode export**.
 3. **Fill in its settings.** With **USB bgcode export** selected in the Plugins dialog, choose **Config** in the menu at the bottom, set these values in the JSON, and click **Save**. Write paths with `/` or `\\`.
 
    | Setting | Value |

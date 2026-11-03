@@ -7,10 +7,6 @@ libbgcode_reference/
 testdata/*.gcode
 testdata/*.bgcode
 
-# Old settings files with local paths and addresses, no longer read (the settings are in Orca now)
-orca_plugin/usb_bgcode_export/local_config.json
-helper/local_config.json
-
 # Python and editor clutter
 __pycache__/
 *.pyc
