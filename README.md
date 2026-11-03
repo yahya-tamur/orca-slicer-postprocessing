@@ -3,7 +3,7 @@
 An Orca Slicer plugin for Prusa printers (made for the CORE One) on Windows. It gives Orca what PrusaSlicer has for these printers:
 
 - **Binary G-code.** Orca can't write Prusa's binary G-code (`.bgcode`), which is smaller and loads faster on the printer. The plugin converts after slicing, with the same result PrusaSlicer would produce.
-- **Print straight to a USB stick.** Orca's Print button hands the file to a small helper on your PC, which writes it to a USB stick and ejects it, then tells you when to unplug. It can also send the file to the printer over the network (PrusaLink) and start the print.
+- **Print straight to a USB stick.** You can plug in a USB stick before or after clicking Print. The helper writes the file, ejects the stick, and tells you when it's safe to take it out. It can also send the file over PrusaLink and start the print.
 - **Camera (optional).** Adds a live camera view to PrusaLink's page in Orca's Device tab.
 
 To get plain G-code for a while, untick **Export as bgcode** under Process → Others → Slicing Pipeline Plugin. It's ticked again when you open a project or change the process preset.
