@@ -525,14 +525,63 @@ class Job:
 
 FILE_LINE_CHARS = 56  # a file's line in the window is kept to this length (longer names are shortened)
 
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+user32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+GW_OWNER, GWLP_HWNDPARENT = 4, -8
+
+
+def main_window_of(pid):
+    """The biggest visible, unowned top-level window of process pid (Orca's main window), or None."""
+    best = [None, 0]
+
+    def visit(hwnd, _):
+        owner_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+        if owner_pid.value == pid and user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, GW_OWNER):
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            area = (r.right - r.left) * (r.bottom - r.top)
+            if area > best[1]:
+                best[:] = [hwnd, area]
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(visit), 0)
+    return best[0]
+
 
 class Window:
     """One status window per job; driven from the Tk thread via a queue."""
 
-    def __init__(self, root):
+    def __init__(self, root, orca_pid=None):
         self.root = root
+        self.orca_pid = orca_pid
         self.top = None
         self.choice = None
+
+    def stay_above_orca(self):
+        """Make Orca's main window this window's owner: Windows then always keeps it above Orca (and
+        minimizes it with Orca), without putting it above other programs. Showing it from another
+        process isn't enough: Orca reactivates when its upload dialog closes and covers it."""
+        if not self.orca_pid:
+            return
+        try:
+            orca = main_window_of(self.orca_pid)
+            self.top.update_idletasks()  # Tk creates the window's outer frame only when it's mapped
+            hwnd = int(self.top.wm_frame(), 16)
+            if orca and user32.GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != orca:
+                user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, orca)
+        except Exception as e:
+            log.warning("couldn't put the window above Orca: %s", e)
 
     def show(self, filename):
         if self.top is None or not self.top.winfo_exists():
@@ -560,6 +609,7 @@ class Window:
             self.buttons.pack_propagate(False)
         self.title.config(text=filename if len(filename) <= 46 else filename[:43] + "...")
         self.top.deiconify()
+        self.stay_above_orca()  # every time: Orca's main window may have been recreated
         self.top.lift()
         self.top.attributes("-topmost", True)
         self.top.after(300, lambda: self.top.attributes("-topmost", False))
@@ -949,7 +999,8 @@ class Worker(threading.Thread):
             self.finish(t("start_failed", file=name, error=e), 0.0)
             return
         log.info("started %s via PrusaLink", name)
-        self.finish(t("printing", file=name))
+        self.call(win.update, t("printing", file=name), 1.0)
+        self.call(win.set_buttons, [(t("button_ok"), win.close)])
 
     def close_when_unplugged(self, letter, timeout=600):
         """Close the window once the ejected stick is physically removed (its drive letter goes away).
@@ -1135,7 +1186,7 @@ def main():
 
     root = tk.Tk()
     root.withdraw()
-    win = Window(root)
+    win = Window(root, args.orca_pid)
     jobs = queue.Queue()
     ui = queue.Queue()
     Worker(jobs, ui, args.test_dir).start()
