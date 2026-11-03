@@ -6,6 +6,9 @@ PrusaLink login, so the page never asks for an API key. The script puts the came
 thumbnail is shown. The camera's RTSP stream is turned into MJPEG by ffmpeg, which only runs while
 someone is watching.
 
+With "share_to_local_network" on in the plugin's settings, the page is also served to other devices on
+the network, with the same login added, so anyone there can use the printer without the password.
+
     python printer_page.py [--port 51201]
 
 The usb_print_host helper starts this with Orca; Orca's Device tab then points at
@@ -19,6 +22,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -180,6 +184,17 @@ class Camera:
                 self.viewers -= 1
 
 
+def lan_address(printer):
+    """This PC's address on the printer's network (the one it would use to reach the printer)."""
+    try:
+        host = urllib.parse.urlsplit(printer()[0]).hostname
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((host, 80))  # no packet is sent; this only picks the route
+            return s.getsockname()[0]
+    except Exception:
+        return socket.gethostbyname(socket.gethostname())
+
+
 class Proxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     printer = None   # callable -> (base_url, user, password)
@@ -287,8 +302,9 @@ class Proxy(BaseHTTPRequestHandler):
 def serve(port, printer, config):
     """Run the page server (blocking). printer: callable -> (base_url, user, password)."""
     Proxy.printer = staticmethod(printer)
+    shared = str(config.get("share_to_local_network", "")).lower() in ("true", "1", "yes", "on")
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Proxy)
+        server = ThreadingHTTPServer(("0.0.0.0" if shared else "127.0.0.1", port), Proxy)
     except OSError as e:
         log.warning("printer page: port %d is busy (%s)", port, e)
         return
@@ -300,6 +316,8 @@ def serve(port, printer, config):
             log.warning("camera: ffmpeg not found; the page is served without a camera")
     server.daemon_threads = True
     log.info("printer page on http://127.0.0.1:%d (camera: %s)", port, "on" if Proxy.camera else "off")
+    if shared:
+        log.info("printer page shared on the local network: http://%s:%d", lan_address(printer), port)
     server.serve_forever()
 
 

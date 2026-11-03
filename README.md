@@ -4,7 +4,7 @@ An Orca Slicer plugin for Prusa printers (made for the CORE One) on Windows. It 
 
 - **Binary G-code.** Orca can't write Prusa's binary G-code (`.bgcode`), which is smaller and loads faster on the printer. The plugin converts after slicing, with the same result PrusaSlicer would produce.
 - **Print straight to a USB stick.** You can plug in a USB stick before or after clicking Print. The helper writes the file, ejects the stick, and tells you when it's safe to take it out. It can also send the file over PrusaLink and start the print.
-- **Camera (optional).** Adds a live camera view to PrusaLink's page in Orca's Device tab.
+- **Camera (optional).** Adds a live camera view to PrusaLink's page in Orca's Device tab, and optionally on other devices on your network.
 
 To get plain G-code for a while, untick **Export as bgcode** under Process → Others → Slicing Pipeline Plugin. It's ticked again when you open a project or change the process preset.
 
@@ -24,6 +24,7 @@ You need Windows, Orca Slicer 2.5 or newer, Python 3 (standard library only), an
    | `printer_preset` | your printer's name in Orca's printer list |
    | `project` | the folder you cloned into, for example `C:/Users/you/orca_slicer_to_prusa_usb` |
    | `pythonw` | your `pythonw.exe` (variables like `%LOCALAPPDATA%` work) |
+   | `share_to_local_network` | optional, default `false`: `true` to open the printer page with the camera from other devices too, at `http://<this PC's address>:51201`. **There's no password:** the helper logs in for every visitor, so anyone on your local network can start, stop and delete prints, bypassing the PrusaLink password. Windows asks once whether to allow Python on the network. |
 
 4. **Restart Orca** and click **Allow** when it asks to run the helper and the converter.
 5. **Connect the printer to the helper.** Click **Connection** above the printer preset to open the **Physical Printer** dialog, and set:

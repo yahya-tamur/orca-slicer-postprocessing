@@ -52,6 +52,7 @@ DEFAULT_SETTINGS = {
     "printer": "",         # the printer's address, e.g. http://192.168.1.40
     "camera": "",          # optional: the camera's RTSP address
     "ffmpeg": "",          # optional: ffmpeg.exe, if it's not on the PATH
+    "share_to_local_network": False,  # optional: the printer page for other devices too, without a password
 }
 
 
