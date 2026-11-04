@@ -663,7 +663,17 @@ class Worker(threading.Thread):
             self.cancel.clear()
             try:
                 self.add(job)
-                self.process_batch()
+                while True:
+                    try:
+                        self.process_batch()
+                        break
+                    except Exception as e:
+                        # E.g. the stick pulled out while writing. Try again writes the files not yet
+                        # written, waiting for a drive again if needed.
+                        log.exception("batch failed")
+                        if not self.try_again(t("failed", error=e)):
+                            break
+                        self.cancel.clear()
             except Exception as e:  # keep serving later uploads
                 log.exception("batch failed")
                 self.finish(t("failed", error=e), 0.0)
@@ -796,6 +806,17 @@ class Worker(threading.Thread):
         self.call(win.update, text, progress)
         self.call(win.set_buttons, [(t("button_close"), win.close)])
 
+    def try_again(self, text):
+        """Show an error with Close / Try again and wait; True for Try again, else the window closes."""
+        self.call(win.update, text, 0.0)
+        self.call(win.set_buttons, [(t("button_close"), lambda: self.picked.put(False)),
+                                    (t("button_try_again"), lambda: self.picked.put(True))])
+        again = self.picked.get()
+        self.call(win.set_buttons, [])
+        if not again:
+            self.call(win.close)
+        return again
+
     # ---- the batch
     def process_batch(self):
         self.collect()
@@ -871,13 +892,7 @@ class Worker(threading.Thread):
                 self.close_when_unplugged(letter)
                 return
             log.warning("eject of %s still not done after the timeout", letter)
-            self.call(win.update, t("eject_failed", drive=name), 0.0)
-            self.call(win.set_buttons, [(t("button_close"), lambda: self.picked.put(False)),
-                                        (t("button_try_again"), lambda: self.picked.put(True))])
-            again = self.picked.get()
-            self.call(win.set_buttons, [])
-            if not again:
-                self.call(win.close)
+            if not self.try_again(t("eject_failed", drive=name)):
                 return
 
     def write_all(self, root, name):
@@ -921,11 +936,12 @@ class Worker(threading.Thread):
         job.data = None
         log.info("wrote %s", target)
 
-    def send_prusalink(self):
-        """Upload the batch to the printer's own storage over the network instead of a USB drive."""
+    def send_prusalink(self, sent=None):
+        """Upload the batch to the printer's own storage over the network instead of a USB drive.
+        sent: the files already sent, when trying again after an error (those aren't sent again)."""
         self.cancel.clear()
         self.call(win.set_buttons, [(t("button_cancel"), self.cancel.set)])
-        sent = []
+        sent = [] if sent is None else sent
         try:
             base, user, password = prusalink_settings()
             self.call(win.update, t("connecting", address=base), busy=True)
@@ -975,7 +991,9 @@ class Worker(threading.Thread):
             if str(e) == "cancelled":  # the files already sent show done
                 self.finish(t("send_cancelled", files=self.files_block(3, writing=True)), 0.0)
             else:  # no room for the files next to an error of up to two lines
-                self.finish(t("send_failed", done=len(sent), total=len(self.batch), error=e), 0.0)
+                # Try again: e.g. after plugging a USB stick into the printer.
+                if self.try_again(t("send_failed", done=len(sent), total=len(self.batch), error=e)):
+                    self.send_prusalink(sent)
             return
         name = sent[0].target  # with several files, the first one sent is offered
         if len(sent) == 1:
@@ -996,7 +1014,8 @@ class Worker(threading.Thread):
             link.start_print(storage, name)
         except Exception as e:
             log.warning("starting %s via PrusaLink failed: %s", name, e)
-            self.finish(t("start_failed", file=name, error=e), 0.0)
+            if self.try_again(t("start_failed", file=name, error=e)):  # e.g. the printer was still busy
+                self.start_print(link, storage, name)
             return
         log.info("started %s via PrusaLink", name)
         self.call(win.update, t("printing", file=name), 1.0)
