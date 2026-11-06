@@ -16,6 +16,8 @@
 // leaves the page as it is. With no camera (not configured, ffmpeg missing) the page shows its
 // thumbnail as usual.
 //
+// Tab title: the printer's state, with the progress while printing ("90% - Printing", "Printer Idle").
+//
 // Buttons (shown when the mouse is over the camera): play/pause and fullscreen; double-click also
 // toggles fullscreen. Paused shows the last frame and stops the stream, as does hiding the page.
 (() => {
@@ -227,10 +229,44 @@
         details.appendChild(buttons);
     }
 
+    // The tab's title from the printer's state, so the tab says how the print is going: "90% - Printing",
+    // "Printer Idle", ... The state comes from /api/v1/status every 5 s (browsers slow that down in
+    // background tabs, to about once a minute after a while). update() puts the title back whenever the
+    // page changes it.
+    const TITLES = {
+        PRINTING: (p) => `${p}% - Printing`,
+        PAUSED: (p) => `${p}% - Paused`,
+        ATTENTION: () => "Printer Needs Attention",
+        FINISHED: () => "Printer Finished",
+        STOPPED: () => "Printer Stopped",
+        IDLE: () => "Printer Idle",
+        READY: () => "Printer Ready",
+        BUSY: () => "Printer Busy",
+        ERROR: () => "Printer Error",
+    };
+    let title = null;
+
+    async function updateTitle() {
+        try {
+            const r = await fetch("/api/v1/status", { cache: "no-store" });
+            if (!r.ok) throw new Error(r.status);
+            const status = await r.json();
+            const state = status.printer?.state;
+            const pct = Math.floor(status.job?.progress ?? 0);  // never 100% while still printing
+            title = (TITLES[state] || (() => `Printer ${state}`))(pct);
+        } catch (e) {
+            title = "Printer Offline";
+        }
+        if (document.title !== title) document.title = title;
+    }
+    updateTitle();
+    setInterval(updateTitle, 5000);
+
     function update() {
         placeCamera();
         updateProgress();
         moveButtons();
+        if (title && document.title !== title) document.title = title;
     }
 
     // Below 992 px the page switches to its phone layout: 32 pt text, stacked status, menu button,

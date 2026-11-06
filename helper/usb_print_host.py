@@ -36,6 +36,7 @@ import printer_page
 
 DEFAULT_PORT = 51200
 BGCODE_MAGIC = b"GCDE"  # first bytes of a Prusa binary G-code file
+PRINTING_CLOSE_DELAY = 30  # seconds "Now printing" stays before the window closes by itself
 LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "OrcaUsbBgcode")
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(filename=os.path.join(LOG_DIR, "helper.log"), level=logging.INFO,
@@ -1018,8 +1019,12 @@ class Worker(threading.Thread):
                 self.start_print(link, storage, name)
             return
         log.info("started %s via PrusaLink", name)
-        self.call(win.update, t("printing", file=name), 1.0)
+        text = t("printing", file=name)
+        self.call(win.update, text, 1.0)
         self.call(win.set_buttons, [(t("button_ok"), win.close)])
+        # Closes by itself after 30 s, unless a newer upload has taken the window over meanwhile.
+        time.sleep(PRINTING_CLOSE_DELAY)
+        self.call(lambda: win.status.cget("text") == text and win.close())
 
     def close_when_unplugged(self, letter, timeout=600):
         """Close the window once the ejected stick is physically removed (its drive letter goes away).
